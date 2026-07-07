@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2025-2026 darktable developers.
+    Copyright (C) 2025 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -38,7 +38,7 @@
 #include <pango/pangocairo.h>
 #include <stdlib.h>
 
-DT_MODULE_INTROSPECTION(7, dt_iop_agx_params_t)
+DT_MODULE_INTROSPECTION(9, dt_iop_agx_params_t)
 
 const char *name()
 {
@@ -152,6 +152,12 @@ typedef struct dt_iop_agx_params_t
 
   // v5
   gboolean completely_reverse_primaries; // $DEFAULT: FALSE $DESCRIPTION: "reverse all"
+
+  // v8
+  float shadow_desaturation;    // $MIN: 0.f $MAX: 1.f $DEFAULT: 0.5f $DESCRIPTION: "shadow desaturation"
+
+  // v9
+  float shadow_desat_pivot_ev;  // $MIN: -6.f $MAX: 6.f $DEFAULT: 0.f $DESCRIPTION: "shadow desaturation range"
 } dt_iop_agx_params_t;
 
 typedef struct dt_iop_basic_curve_controls_t
@@ -199,6 +205,20 @@ typedef struct dt_iop_agx_gui_data_t
   GtkWidget *completely_reverse_primaries;
   GtkWidget *post_curve_primaries_controls_vbox;
   GtkWidget *set_post_curve_primaries_from_pre_button;
+
+  // --- Mouse interaction on the curve ---
+  gboolean dragging;
+  int      drag_node;
+  int      drag_axis;
+  double   drag_start_x, drag_start_y;
+  float    drag_p0, drag_p1;
+
+  // --- Histogram ---
+  uint32_t histogram[256];   // normalised in log-encoded space (aligns with the curve X axis)
+  uint32_t histogram_max;
+  uint32_t histogram_cliplo; // pixels below black_relative_ev
+  uint32_t histogram_cliphi; // pixels above white_relative_ev
+  uint32_t histogram_total;
 } dt_iop_agx_gui_data_t;
 
 typedef struct tone_mapping_params_t
@@ -249,6 +269,10 @@ typedef struct tone_mapping_params_t
   float look_original_hue_mix_ratio;
   gboolean look_tuned;
   gboolean restore_hue;
+
+  // shadow desaturation (pre-curve)
+  float shadow_desaturation;
+  float shadow_desat_pivot_ev;
 } tone_mapping_params_t;
 
 typedef struct primaries_params_t
@@ -291,6 +315,30 @@ int legacy_params(dt_iop_module_t *self,
     *new_params_size = sizeof(dt_iop_agx_params_t);
     *new_version = self->so->version(); // SPECIAL CASE: jump directly to latest version
 
+    return 0;
+  }
+
+  if(old_version == 7)
+  {
+    // v8 adds shadow_desaturation at the end of the struct.
+    // calloc zero-initialises, so shadow_desaturation will be 0.f (= default, no behaviour change).
+    dt_iop_agx_params_t *np = calloc(1, sizeof(dt_iop_agx_params_t));
+    memcpy(np, old_params, offsetof(dt_iop_agx_params_t, shadow_desaturation));
+    *new_params = np;
+    *new_params_size = sizeof(dt_iop_agx_params_t);
+    *new_version = 8;
+    return 0;
+  }
+
+  if(old_version == 8)
+  {
+    // v9 adds shadow_desat_pivot_ev after shadow_desaturation.
+    // calloc zero-initialises it to 0.f (= default, no behaviour change).
+    dt_iop_agx_params_t *np = calloc(1, sizeof(dt_iop_agx_params_t));
+    memcpy(np, old_params, offsetof(dt_iop_agx_params_t, shadow_desat_pivot_ev));
+    *new_params = np;
+    *new_params_size = sizeof(dt_iop_agx_params_t);
+    *new_version = 9;
     return 0;
   }
 
@@ -851,6 +899,10 @@ static tone_mapping_params_t _calculate_tone_mapping_params(const dt_iop_agx_par
                                    || p -> look_saturation != 1.f;
   tone_mapping_params.restore_hue = p->look_original_hue_mix_ratio != 0.f;
 
+  // shadow desaturation (pre-curve)
+  tone_mapping_params.shadow_desaturation = p->shadow_desaturation;
+  tone_mapping_params.shadow_desat_pivot_ev = p->shadow_desat_pivot_ev;
+
   // log mapping
   _set_log_mapping_params(p, &tone_mapping_params);
 
@@ -1004,7 +1056,7 @@ static primaries_params_t _get_primaries_params(const dt_iop_agx_params_t *p)
 static void _update_pivot_slider_settings(GtkWidget* const slider,
                                          const dt_iop_agx_params_t* const p)
 {
-  DT_ENTER_GUI_UPDATE();
+  darktable.gui->reset++;
 
   const float range = p->range_white_relative_ev - p->range_black_relative_ev;
 
@@ -1015,7 +1067,7 @@ static void _update_pivot_slider_settings(GtkWidget* const slider,
 
   dt_bauhaus_slider_set(slider, p->curve_pivot_x);
 
-  DT_LEAVE_GUI_UPDATE();
+  darktable.gui->reset--;
 }
 
 static void _update_pivot_x(const float old_black_ev, const float old_white_ev, dt_iop_module_t *self, dt_iop_agx_params_t *const p)
@@ -1058,12 +1110,48 @@ static void _agx_tone_mapping(dt_aligned_pixel_t rgb_in_out,
                               const tone_mapping_params_t *params,
                               const dt_colormatrix_t rendering_to_xyz_transposed)
 {
-  // record current chromaticity angle
+  // 1. Record original hue BEFORE any processing (including shadow desaturation),
+  //    so restore_hue works on the true scene chromaticity.
   dt_aligned_pixel_t hsv_pixel = { 0.f };
   if(params->restore_hue)
     dt_RGB_2_HSV(rgb_in_out, hsv_pixel);
   const float h_before = hsv_pixel[0];
 
+  // 2. Shadow desaturation: pre-curve, mirrors the highlight desaturation that
+  //    emerges naturally from the sigmoid shoulder.
+  //    Reduces inter-channel divergence before the toe compresses them
+  //    non-linearly, preventing spurious saturation boost in dark areas.
+  if(params->shadow_desaturation > 0.f)
+  {
+    // Luminance in rendering space (uses the inset primaries matrix — correct here)
+    const float Y_in = _luminance_from_matrix(rgb_in_out, rendering_to_xyz_transposed);
+
+    // Log-encode the luminance to place it on the curve's x-axis [0, 1]
+    const float log_Y = _apply_log_encoding(Y_in, params->range_in_ev, params->black_relative_ev);
+
+    // Shadow mask: 1 at pure black (log_Y = 0), smoothly 0 at the pivot reference.
+    // The pivot reference is anchored to 18% gray (0 EV) shadow_desat_pivot_ev shifts it up or down
+    // in EV relative to mid-gray: positive pushes the limit into midtones,
+    // negative restricts desaturation to deeper shadows only.
+    // smoothstep inlined (not in C99 stdlib): t = clamp(x/edge), result = t²(3-2t)
+    const float x_midgray = (-params->black_relative_ev + params->shadow_desat_pivot_ev)
+                            / params->range_in_ev;
+    const float _t = CLAMPF(log_Y / fmaxf(_epsilon, x_midgray), 0.f, 1.f);
+    const float mask = 1.f - (_t * _t * (3.f - 2.f * _t));
+
+    const float effective_desat = params->shadow_desaturation * mask;
+
+    if(effective_desat > 0.f)
+    {
+      // Same formula as _agx_look(): pixel = luma + sat * (pixel - luma)
+      // with sat = (1 - effective_desat), rewritten for FMA:
+      // pixel += effective_desat * (Y_in - pixel)
+      for_three_channels(k, aligned(rgb_in_out : 16))
+        rgb_in_out[k] = DT_FMA(effective_desat, Y_in - rgb_in_out[k], rgb_in_out[k]);
+    }
+  }
+
+  // 3. Per-channel log-encode + tone mapping curve
   dt_aligned_pixel_t transformed_pixel = { 0.f };
 
   for_three_channels(k, aligned(rgb_in_out, transformed_pixel : 16))
@@ -1111,9 +1199,9 @@ static void _apply_auto_black_exposure(const dt_iop_module_t *self)
            -20.f,
            -0.1f);
 
-  DT_ENTER_GUI_UPDATE();
+  ++darktable.gui->reset;
   dt_bauhaus_slider_set(g->black_exposure_picker, p->range_black_relative_ev);
-  DT_LEAVE_GUI_UPDATE();
+  --darktable.gui->reset;
 }
 
 static void _apply_auto_white_exposure(const dt_iop_module_t *self)
@@ -1127,9 +1215,9 @@ static void _apply_auto_white_exposure(const dt_iop_module_t *self)
            0.1f,
            20.f);
 
-  DT_ENTER_GUI_UPDATE();
+  ++darktable.gui->reset;
   dt_bauhaus_slider_set(g->white_exposure_picker, p->range_white_relative_ev);
-  DT_LEAVE_GUI_UPDATE();
+  --darktable.gui->reset;
 }
 
 static void _apply_auto_tune_exposure(const dt_iop_module_t *self)
@@ -1149,10 +1237,10 @@ static void _apply_auto_tune_exposure(const dt_iop_module_t *self)
            0.1f,
            20.f);
 
-  DT_ENTER_GUI_UPDATE();
+  ++darktable.gui->reset;
   dt_bauhaus_slider_set(g->black_exposure_picker, p->range_black_relative_ev);
   dt_bauhaus_slider_set(g->white_exposure_picker, p->range_white_relative_ev);
-  DT_LEAVE_GUI_UPDATE();
+  --darktable.gui->reset;
 }
 
 static void _read_exposure_params_callback(GtkWidget *widget,
@@ -1191,12 +1279,12 @@ static void _apply_auto_pivot_xy(dt_iop_module_t *self, const dt_iop_order_iccpr
   p->curve_pivot_y_linear_output = target_y_linearised;
   p->curve_pivot_x = picked_pivot_x;
 
-  DT_ENTER_GUI_UPDATE();
+  ++darktable.gui->reset;
   dt_bauhaus_slider_set(g->basic_curve_controls.curve_pivot_x,
                         p->curve_pivot_x);
   dt_bauhaus_slider_set(g->basic_curve_controls.curve_pivot_y_linear,
                         p->curve_pivot_y_linear_output);
-  DT_LEAVE_GUI_UPDATE();
+  --darktable.gui->reset;
 }
 
 // move only the pivot's relative (input) exposure, but don't change its output
@@ -1214,9 +1302,9 @@ static void _apply_auto_pivot_x(dt_iop_module_t *self, const dt_iop_order_iccpro
   p->curve_pivot_x = (picked_ev - p->range_black_relative_ev) / range;
 
   // Update the slider visually
-  DT_ENTER_GUI_UPDATE();
+  darktable.gui->reset++;
   dt_bauhaus_slider_set(g->basic_curve_controls.curve_pivot_x, p->curve_pivot_x);
-  DT_LEAVE_GUI_UPDATE();
+  darktable.gui->reset--;
 }
 
 static void _create_matrices(const primaries_params_t *params,
@@ -1323,6 +1411,60 @@ static void _create_matrices(const primaries_params_t *params,
                      base_to_pipe_transposed);
 }
 
+static void agx_compute_histogram(dt_iop_module_t *self,
+                                   dt_dev_pixelpipe_iop_t *piece,
+                                   const void *const ivoid,
+                                   const dt_iop_roi_t *const roi_in)
+{
+  dt_iop_agx_gui_data_t *g = self->gui_data;
+  if(!g) return;
+  if(!(piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW)) return;
+
+  const dt_iop_agx_data_t *d = piece->data;
+  const tone_mapping_params_t *tm = &d->tone_mapping_params;
+  const size_t ch = piece->colors;
+  const size_t npix = (size_t)roi_in->width * roi_in->height;
+  const float *buf = (const float *)ivoid;
+
+  uint32_t hist[256];
+  memset(hist, 0, sizeof(hist));
+  uint32_t cliplo = 0, cliphi = 0, total = 0;
+
+  // Stride: 1 pixel out of 4 for large images
+  const size_t step = (npix > 500000) ? 4 : 1;
+
+  for(size_t k = 0; k < npix; k += step)
+  {
+    const float *px = buf + ch * k;
+    if(!isfinite(px[0]) || !isfinite(px[1]) || !isfinite(px[2])) continue;
+
+    // Rec.709 luminance — same approximation as in process()
+    const float Y = fmaxf(0.2126f * fmaxf(px[0], 0.f)
+                        + 0.7152f * fmaxf(px[1], 0.f)
+                        + 0.0722f * fmaxf(px[2], 0.f), _epsilon);
+    total++;
+
+    // Same log-encode as process() → aligns exactly with the graph X axis
+    const float xnorm = _apply_log_encoding(Y, tm->range_in_ev, tm->black_relative_ev);
+
+    if(xnorm <= 0.f)      cliplo++;
+    else if(xnorm >= 1.f) cliphi++;
+    else                  hist[CLAMP((int)(xnorm * 255.f), 0, 255)]++;
+  }
+
+  uint32_t hmax = 1;
+  for(int b = 0; b < 256; b++)
+    if(hist[b] > hmax) hmax = hist[b];
+
+  memcpy(g->histogram, hist, sizeof(hist));
+  g->histogram_max    = hmax;
+  g->histogram_cliplo = cliplo;
+  g->histogram_cliphi = cliphi;
+  g->histogram_total  = total;
+
+  if(g->graph_drawing_area)
+    gtk_widget_queue_draw(GTK_WIDGET(g->graph_drawing_area));
+}
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,
@@ -1411,6 +1553,239 @@ void process(dt_iop_module_t *self,
     // Copy over the alpha channel
     pix_out[3] = sanitised_in[3];
   }
+  agx_compute_histogram(self, piece, ivoid, roi_in);
+}
+
+// ============================================================
+// MOUSE INTERACTION ON THE CURVE
+// ============================================================
+
+#define AGX_DRAG_PIVOT     0
+#define AGX_DRAG_TOE       1
+#define AGX_DRAG_SHOULDER  2
+#define AGX_DRAG_TARGET_BK 3
+#define AGX_DRAG_TARGET_WH 4
+#define AGX_DRAG_CONTRAST  5
+#define AGX_HIT_R          14
+
+// Converts widget coordinates (pixels, y=0 at top) to normalised graph
+// coordinates (x_norm, y_norm ∈ [0,1], y=0 at bottom).
+// Requires margin_left, margin_top, graph_width, graph_height as computed in _agx_draw_curve.
+static void _widget_to_graph(const dt_iop_agx_gui_data_t *g,
+                             double wx, double wy,
+                             float *gx, float *gy)
+{
+  const float line_height = g->ink.height;
+  const int inset = DT_PIXEL_APPLY_DPI(4);
+  const float margin_left = 3.f * line_height + 2.f * inset;
+  const float margin_bottom = 2.f * line_height + 2.f * inset;
+  const float margin_top = inset + 0.5f * line_height;
+  const float graph_width = g->allocation.width - inset - margin_left;
+  const float graph_height = g->allocation.height - margin_bottom - margin_top;
+
+  *gx = ((float)wx - margin_left) / fmaxf(graph_width, 1.0f);
+  *gy = 1.0f - ((float)wy - margin_top) / fmaxf(graph_height, 1.0f);  // flip Y
+}
+
+static int _agx_hit_test(float gx, float gy,
+                         const tone_mapping_params_t *t,
+                         gboolean shift_held)
+{
+  // Outside the graph
+  if(gx < -0.05f || gx > 1.05f || gy < -0.05f || gy > 1.05f) return -1;
+
+  const float hr = 0.04f;  // hit radius in normalised coordinates
+
+  // 1. Endpoints target_black / target_white — high priority
+  {
+    const float bx = 0.0f, by = _apply_curve(0.0f, t);
+    if((gx-bx)*(gx-bx)+(gy-by)*(gy-by) <= hr*hr) return AGX_DRAG_TARGET_BK;
+  }
+  {
+    const float wx = 1.0f, wy = _apply_curve(1.0f, t);
+    if((gx-wx)*(gx-wx)+(gy-wy)*(gy-wy) <= hr*hr) return AGX_DRAG_TARGET_WH;
+  }
+
+  // 2. Pivot — SHIFT = contraste
+  {
+    const float px = t->pivot_x, py = t->pivot_y;
+    if((gx-px)*(gx-px)+(gy-py)*(gy-py) <= hr*hr)
+      return shift_held ? AGX_DRAG_CONTRAST : AGX_DRAG_PIVOT;
+  }
+
+  // 3. Zones — left = toe, right = shoulder
+  if(gx < t->pivot_x)
+    return AGX_DRAG_TOE;
+  return AGX_DRAG_SHOULDER;
+}
+
+static gboolean _agx_curve_press(GtkWidget *w, GdkEventButton *ev, gpointer ud)
+{
+  if(ev->button != 1) return FALSE;
+  dt_iop_module_t *self = ud;
+  dt_iop_agx_gui_data_t *g = self->gui_data;
+  dt_iop_agx_params_t *p = self->params;
+
+  const tone_mapping_params_t t = _calculate_tone_mapping_params(p);
+  float gx, gy;
+  _widget_to_graph(g, ev->x, ev->y, &gx, &gy);
+  const gboolean shift = (ev->state & GDK_SHIFT_MASK) != 0;
+  int hit = _agx_hit_test(gx, gy, &t, shift);
+  if(hit < 0) return FALSE;
+
+  // Double-click: reset
+  if(ev->type == GDK_2BUTTON_PRESS)
+  {
+    if(hit == AGX_DRAG_TARGET_BK)
+    {
+      p->curve_target_display_black_ratio = 0.0f;
+      dt_iop_gui_update(self);
+      gtk_widget_queue_draw(GTK_WIDGET(g->graph_drawing_area));
+      dt_dev_add_history_item(self->dev, self, TRUE);
+      return TRUE;
+    }
+    if(hit == AGX_DRAG_TARGET_WH)
+    {
+      p->curve_target_display_white_ratio = 1.0f;
+      dt_iop_gui_update(self);
+      gtk_widget_queue_draw(GTK_WIDGET(g->graph_drawing_area));
+      dt_dev_add_history_item(self->dev, self, TRUE);
+      return TRUE;
+    }
+  }
+
+  g->dragging = TRUE;
+  g->drag_node = hit;
+  g->drag_axis = 0;
+  g->drag_start_x = ev->x;
+  g->drag_start_y = ev->y;
+  switch(hit)
+  {
+    case AGX_DRAG_PIVOT:      g->drag_p0 = p->curve_pivot_x;
+                              g->drag_p1 = p->curve_pivot_y_linear_output; break;
+    case AGX_DRAG_CONTRAST:   g->drag_p0 = p->curve_contrast_around_pivot; break;
+    case AGX_DRAG_TOE:        g->drag_p0 = p->curve_linear_ratio_below_pivot;
+                              g->drag_p1 = p->curve_toe_power; break;
+    case AGX_DRAG_SHOULDER:   g->drag_p0 = p->curve_linear_ratio_above_pivot;
+                              g->drag_p1 = p->curve_shoulder_power; break;
+    case AGX_DRAG_TARGET_BK:  g->drag_p0 = p->curve_target_display_black_ratio; break;
+    case AGX_DRAG_TARGET_WH:  g->drag_p0 = p->curve_target_display_white_ratio; break;
+  }
+  dt_iop_request_focus(self);
+  return TRUE;
+}
+
+static gboolean _agx_curve_motion(GtkWidget *w, GdkEventMotion *ev, gpointer ud)
+{
+  dt_iop_module_t *self = ud;
+  dt_iop_agx_gui_data_t *g = self->gui_data;
+  dt_iop_agx_params_t *p = self->params;
+
+  // Hover — cursor and tooltip
+  if(!g->dragging)
+  {
+    const tone_mapping_params_t t = _calculate_tone_mapping_params(p);
+    float gx, gy;
+    _widget_to_graph(g, ev->x, ev->y, &gx, &gy);
+    const gboolean shift = (ev->state & GDK_SHIFT_MASK) != 0;
+    int hit = _agx_hit_test(gx, gy, &t, shift);
+
+    const char *cn = (hit == AGX_DRAG_PIVOT) ? "move"
+                   : (hit == AGX_DRAG_CONTRAST) ? "ns-resize"
+                   : (hit == AGX_DRAG_TARGET_BK || hit == AGX_DRAG_TARGET_WH) ? "row-resize"
+                   : (hit == AGX_DRAG_TOE || hit == AGX_DRAG_SHOULDER) ? "col-resize"
+                   : "default";
+    GdkCursor *cur = gdk_cursor_new_from_name(gdk_display_get_default(), cn);
+    gdk_window_set_cursor(gtk_widget_get_window(w), cur);
+    g_object_unref(cur);
+
+    const char *tip = NULL;
+    switch(hit)
+    {
+      case AGX_DRAG_TARGET_BK:
+        tip = _("Target black — drag ↕\ndouble-click: reset"); break;
+      case AGX_DRAG_TARGET_WH:
+        tip = _("Target white — drag ↕\ndouble-click: reset"); break;
+      case AGX_DRAG_PIVOT:
+        tip = _("Pivot — drag to move\nSHIFT: contrast"); break;
+      case AGX_DRAG_CONTRAST:
+        tip = _("Contrast — SHIFT+drag ↕"); break;
+      case AGX_DRAG_TOE:
+        tip = _("Toe — drag ← extent\ndrag ↕ power"); break;
+      case AGX_DRAG_SHOULDER:
+        tip = _("Shoulder — drag → extent\ndrag ↕ power"); break;
+      default:
+        tip = _("Click to interact with the curve\nSHIFT for contrast"); break;
+    }
+    gtk_widget_set_tooltip_text(w, tip);
+    return FALSE;
+  }
+
+  // Drag — update parameters
+  const float line_height = g->ink.height;
+  const int inset = DT_PIXEL_APPLY_DPI(4);
+  const float graph_width = g->allocation.width - inset - 3.f * line_height - 2.f * inset;
+  const float graph_height = g->allocation.height - (2.f * line_height + 2.f * inset)
+                             - (inset + 0.5f * line_height);
+
+  const float dx =  (float)(ev->x - g->drag_start_x) / fmaxf(graph_width, 1.0f);
+  const float dy = -(float)(ev->y - g->drag_start_y) / fmaxf(graph_height, 1.0f);  // flip Y
+
+  // Axis lock for toe/shoulder
+  if(g->drag_node == AGX_DRAG_TARGET_BK || g->drag_node == AGX_DRAG_TARGET_WH
+     || g->drag_node == AGX_DRAG_CONTRAST)
+  { /* Y seul */ }
+  else if(g->drag_node != AGX_DRAG_PIVOT && g->drag_axis == 0)
+  {
+    float adx = fabsf((float)(ev->x - g->drag_start_x));
+    float ady = fabsf((float)(ev->y - g->drag_start_y));
+    if(adx > 4 || ady > 4) g->drag_axis = (adx >= ady) ? 1 : 2;
+  }
+  const float dxe = (g->drag_node == AGX_DRAG_PIVOT) ? dx : (g->drag_axis == 2) ? 0 : dx;
+  const float dye = (g->drag_node == AGX_DRAG_PIVOT || g->drag_node == AGX_DRAG_TARGET_BK
+                     || g->drag_node == AGX_DRAG_TARGET_WH || g->drag_node == AGX_DRAG_CONTRAST)
+                  ? dy : (g->drag_axis == 1) ? 0 : dy;
+
+  switch(g->drag_node)
+  {
+    case AGX_DRAG_PIVOT:
+      p->curve_pivot_x = CLAMPF(g->drag_p0 + dxe, 0.01f, 0.99f);
+      p->curve_pivot_y_linear_output = CLAMPF(g->drag_p1 + dye, 0.01f, 0.99f);
+      break;
+    case AGX_DRAG_CONTRAST:
+      p->curve_contrast_around_pivot = CLAMPF(g->drag_p0 + dye * 6.0f, 0.1f, 5.0f);
+      break;
+    case AGX_DRAG_TOE:
+      p->curve_linear_ratio_below_pivot = CLAMPF(g->drag_p0 - dxe, 0.0f, 1.0f);
+      p->curve_toe_power = CLAMPF(g->drag_p1 - dye * 5.0f, 1.0f, 5.0f);
+      break;
+    case AGX_DRAG_SHOULDER:
+      p->curve_linear_ratio_above_pivot = CLAMPF(g->drag_p0 + dxe, 0.0f, 1.0f);
+      p->curve_shoulder_power = CLAMPF(g->drag_p1 + dye * 5.0f, 1.0f, 5.0f);
+      break;
+    case AGX_DRAG_TARGET_BK:
+      p->curve_target_display_black_ratio = CLAMPF(g->drag_p0 + dye * 0.05f, 0.0f, 0.025f);
+      break;
+    case AGX_DRAG_TARGET_WH:
+      p->curve_target_display_white_ratio = CLAMPF(g->drag_p0 + dye * 0.5f, 0.5f, 1.0f);
+      break;
+  }
+  dt_iop_gui_update(self);
+  gtk_widget_queue_draw(GTK_WIDGET(g->graph_drawing_area));
+  dt_dev_add_history_item(self->dev, self, TRUE);
+  return TRUE;
+}
+
+static gboolean _agx_curve_release(GtkWidget *w, GdkEventButton *ev, gpointer ud)
+{
+  if(ev->button != 1) return FALSE;
+  dt_iop_module_t *self = ud;
+  dt_iop_agx_gui_data_t *g = self->gui_data;
+  if(!g->dragging) return FALSE;
+  g->dragging = FALSE;
+  g->drag_node = -1;
+  g->drag_axis = 0;
+  return TRUE;
 }
 
 static gboolean _agx_draw_curve(GtkWidget *widget,
@@ -1598,13 +1973,72 @@ static gboolean _agx_draw_curve(GtkWidget *widget,
   }
   cairo_restore(cr);
   // end vertical EV guide lines
+// --- Histogram ---
+if(g->histogram_max > 0 && g->histogram_total > 0)
+{
+  cairo_save(cr);
 
-  // the curve
-  const float line_width = DT_PIXEL_APPLY_DPI(2.);
+  // Log scale: compresses dominant peaks so minority tones remain readable.
+  // Maps [0, 1] -> [0, 1] with log10(1 + 9*x), keeping 0->0 and 1->1.
+  const float log_scale = 1.f / log10f(10.f); // = 1.0, precomputed for clarity
+  const float bw = fmaxf(graph_width / 256.0f, 1.0f);
+
+  for(int b = 0; b < 256; b++)
+  {
+    const float hn_linear = (float)g->histogram[b] / (float)g->histogram_max;
+    if(hn_linear <= 0.f) continue;
+
+    // Logarithmic compression: tall spikes no longer dominate
+    const float hn = log10f(1.f + 9.f * hn_linear) * log_scale;
+
+    // Lighter blue-grey, higher opacity for clear readability behind the curve
+    cairo_set_source_rgba(cr, 0.50f, 0.60f, 0.75f, 0.45f);
+    cairo_rectangle(cr, (float)b * bw, 0.f,
+                    fmaxf(bw - 0.5f, 1.f), hn * graph_height);
+    cairo_fill(cr);
+  }
+
+  // Clipping indicators (triangles bottom-left / bottom-right)
+  const float pctlo = (float)g->histogram_cliplo / (float)g->histogram_total;
+  const float pcthi = (float)g->histogram_cliphi / (float)g->histogram_total;
+  const float trih  = graph_height * 0.25f;
+  const float triw  = DT_PIXEL_APPLY_DPI(14.f);
+
+  if(pctlo > 0.001f)
+  {
+    const float h     = trih * fminf(1.f, 0.3f + pctlo * 7.f);
+    const float alpha = fminf(0.9f, 0.3f + pctlo * 6.f);
+    cairo_set_source_rgba(cr, 0.9, 0.2, 0.15, alpha);
+    cairo_move_to(cr, 0.f,  0.f);
+    cairo_line_to(cr, 0.f,  h);
+    cairo_line_to(cr, triw, 0.f);
+    cairo_close_path(cr);
+    cairo_fill(cr);
+  }
+
+  if(pcthi > 0.001f)
+  {
+    const float h     = trih * fminf(1.f, 0.3f + pcthi * 7.f);
+    const float alpha = fminf(0.9f, 0.3f + pcthi * 6.f);
+    cairo_set_source_rgba(cr, 0.9, 0.2, 0.15, alpha);
+    cairo_move_to(cr, graph_width,        0.f);
+    cairo_line_to(cr, graph_width,        h);
+    cairo_line_to(cr, graph_width - triw, 0.f);
+    cairo_close_path(cr);
+    cairo_fill(cr);
+  }
+
+  cairo_restore(cr);
+}
+  // the curve — high resolution + antialiasing
+  const float line_width = DT_PIXEL_APPLY_DPI(1.5);
   cairo_set_line_width(cr, line_width);
   set_color(cr, darktable.bauhaus->graph_fg);
+  cairo_set_antialias(cr, CAIRO_ANTIALIAS_BEST);
+  cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+  cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
 
-  const int steps = 200;
+  const int steps = (int)graph_width * 2;  // 2 points per pixel
 
   // draw the main curve
   cairo_move_to(cr, 0, _apply_curve(0, &tone_mapping_params) * graph_height);
@@ -1647,9 +2081,8 @@ static gboolean _agx_draw_curve(GtkWidget *widget,
     cairo_stroke(cr);
   }
 
-  // draw the toe start, shoulder start, pivot
+  // draw the toe start, shoulder start, pivot, and endpoints
   cairo_save(cr);
-  // restore line width and color for points
   cairo_set_line_width(cr, line_width);
   set_color(cr, darktable.bauhaus->graph_fg);
 
@@ -1657,6 +2090,22 @@ static gboolean _agx_draw_curve(GtkWidget *widget,
                   graph_width + 2. * DT_PIXEL_APPLY_DPI(4.),
                   graph_height + 2. * DT_PIXEL_APPLY_DPI(4.));
   cairo_clip(cr);
+
+  // Endpoint target_black 
+  {
+    const float y_black = _apply_curve(0.0f, &tone_mapping_params);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.9);
+    cairo_arc(cr, 0.0f, y_black * graph_height, DT_PIXEL_APPLY_DPI(5), 0, 2. * M_PI);
+    cairo_fill(cr);
+  }
+
+  // Endpoint target_white 
+  {
+    const float y_white = _apply_curve(1.0f, &tone_mapping_params);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.9);
+    cairo_arc(cr, graph_width, y_white * graph_height, DT_PIXEL_APPLY_DPI(5), 0, 2. * M_PI);
+    cairo_fill(cr);
+  }
 
   const float x_toe_graph = tone_mapping_params.toe_transition_x * graph_width;
   const float y_toe_graph = tone_mapping_params.toe_transition_y * graph_height;
@@ -1759,7 +2208,7 @@ void gui_changed(dt_iop_module_t *self,
   dt_iop_agx_params_t *p = self->params;
 
   // avoid infinite cascades of GUI changes
-  if(!DT_IN_GUI_UPDATE())
+  if(!darktable.gui->reset)
   {
     if(widget == g->black_exposure_picker)
     {
@@ -1789,10 +2238,10 @@ void gui_changed(dt_iop_module_t *self,
       p->range_white_relative_ev = old_white_ev * (1.f + ratio);
       _update_pivot_x(old_black_ev, old_white_ev, self, p);
 
-      DT_ENTER_GUI_UPDATE();
+      darktable.gui->reset++;
       dt_bauhaus_slider_set(g->black_exposure_picker, p->range_black_relative_ev);
       dt_bauhaus_slider_set(g->white_exposure_picker, p->range_white_relative_ev);
-      DT_LEAVE_GUI_UPDATE();
+      darktable.gui->reset--;
     }
 
     if(g && p->auto_gamma)
@@ -1953,8 +2402,16 @@ static GtkWidget* _create_curve_graph_box(dt_iop_module_t *self,
   g_object_set_data(G_OBJECT(g->graph_drawing_area), "iop-instance", self);
   dt_action_define_iop(self, N_("curve"), N_("graph"), GTK_WIDGET(g->graph_drawing_area), NULL);
   gtk_widget_set_can_focus(GTK_WIDGET(g->graph_drawing_area), TRUE);
+  gtk_widget_add_events(GTK_WIDGET(g->graph_drawing_area),
+    GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
   g_signal_connect(G_OBJECT(g->graph_drawing_area), "draw", G_CALLBACK(_agx_draw_curve), self);
-  gtk_widget_set_tooltip_text(GTK_WIDGET(g->graph_drawing_area), _("tone mapping curve"));
+  g_signal_connect(G_OBJECT(g->graph_drawing_area), "button-press-event",
+    G_CALLBACK(_agx_curve_press), self);
+  g_signal_connect(G_OBJECT(g->graph_drawing_area), "motion-notify-event",
+    G_CALLBACK(_agx_curve_motion), self);
+  g_signal_connect(G_OBJECT(g->graph_drawing_area), "button-release-event",
+    G_CALLBACK(_agx_curve_release), self);
+  gtk_widget_set_tooltip_text(GTK_WIDGET(g->graph_drawing_area), _("tone mapping curve — click to interact"));
 
   // Pack drawing area at the top
   dt_gui_box_add(g->graph_section.container, g->graph_drawing_area);
@@ -2030,6 +2487,35 @@ static GtkWidget* _create_advanced_box(dt_iop_module_t *self,
        "immediate contrast around the pivot is not affected,\n"
        "but shadows and highlights are; you may have to counteract it\n"
        "with the contrast slider or with toe / shoulder controls."));
+
+  // Shadow desaturation — counteracts the saturation boost produced by the toe
+  slider = dt_bauhaus_slider_from_params(section, "shadow_desaturation");
+  dt_bauhaus_slider_set_format(slider, "%");
+  dt_bauhaus_slider_set_digits(slider, 2);
+  dt_bauhaus_slider_set_factor(slider, 100.f);
+  gtk_widget_set_tooltip_text
+    (slider,
+     _("reduce saturation in shadows before the tone mapping curve.\n"
+       "the per-channel toe compression is non-linear: dark channels with\n"
+       "different values are compressed by different amounts, which can\n"
+       "boost saturation in shadows when contrast is raised.\n"
+       "this slider counteracts that by bringing shadow colours closer to\n"
+       "achromatic before the curve processes them — mirroring the natural\n"
+       "desaturation that the sigmoid shoulder produces in highlights.\n"
+       "0: no change.  1: fully desaturate shadows."));
+
+  // Shadow desaturation range — shifts the limit of the shadow zone around 18% gray
+  slider = dt_bauhaus_slider_from_params(section, "shadow_desat_pivot_ev");
+  dt_bauhaus_slider_set_format(slider, _(" EV"));
+  dt_bauhaus_slider_set_soft_range(slider, -6.f, 6.f);
+  dt_bauhaus_slider_set_digits(slider, 2);
+  gtk_widget_set_tooltip_text
+    (slider,
+     _("shift the upper limit of the shadow desaturation zone, in EV\n"
+       "relative to 18% gray (0 EV, the mid-gray reference line on the graph).\n"
+       "0 EV (default): desaturation fades out exactly at mid-gray.\n"
+       "positive values: extend desaturation into the midtones.\n"
+       "negative values: restrict desaturation to deeper shadows only."));
 
   return advanced_box;
 }
@@ -2449,6 +2935,13 @@ static void _notebook_page_changed(GtkNotebook *notebook,
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_agx_gui_data_t *g = IOP_GUI_ALLOC(agx);
+  g->dragging = FALSE;
+  g->drag_node = -1;
+  g->drag_axis = 0;
+
+memset(g->histogram, 0, sizeof(g->histogram));
+g->histogram_max = 0;
+g->histogram_cliplo = g->histogram_cliphi = g->histogram_total = 0;
 
   static dt_action_def_t notebook_def = {};
   g->notebook = dt_ui_notebook_new(&notebook_def);
@@ -2658,7 +3151,7 @@ void color_picker_apply(dt_iop_module_t *self,
                         GtkWidget *picker,
                         dt_dev_pixelpipe_t *pipe)
 {
-  DT_GUARD_GUI_UPDATE();
+  if(darktable.gui->reset) return;
 
   dt_iop_agx_params_t *p = self->params;
   const dt_iop_agx_gui_data_t *g = self->gui_data;
@@ -2676,12 +3169,12 @@ void color_picker_apply(dt_iop_module_t *self,
 
   if(p->auto_gamma)
   {
-    DT_ENTER_GUI_UPDATE();
+    ++darktable.gui->reset;
     tone_mapping_params_t tone_mapping_params;
     _set_log_mapping_params(self->params, &tone_mapping_params);
     _adjust_pivot(self->params, &tone_mapping_params);
     dt_bauhaus_slider_set(g->curve_gamma, tone_mapping_params.curve_gamma);
-    DT_LEAVE_GUI_UPDATE();
+    --darktable.gui->reset;
   }
 
   _update_curve_warnings(self);

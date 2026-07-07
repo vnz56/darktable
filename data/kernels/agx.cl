@@ -55,6 +55,8 @@ typedef struct dt_iop_agx_tone_mapping_params_t
   float look_original_hue_mix_ratio;
   int look_tuned;
   int restore_hue;
+  float shadow_desaturation; // v8 — must stay last, matches tone_mapping_params_t in agx.c
+  float shadow_desat_pivot_ev; // v9
 } dt_iop_agx_tone_mapping_params_t;
 
 static inline void _agx_compress_into_gamut(float4 *pixel)
@@ -177,6 +179,7 @@ static inline float _agx_lerp_hue(const float original_hue, const float processe
 
 static inline void _agx_tone_mapping(float4 *rgb_in_out, const dt_iop_agx_tone_mapping_params_t *params, constant float *rendering_to_xyz)
 {
+    // 1. Record original hue BEFORE any processing (including shadow desaturation)
     float4 hsv_pixel = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
     if(params->restore_hue)
     {
@@ -184,6 +187,32 @@ static inline void _agx_tone_mapping(float4 *rgb_in_out, const dt_iop_agx_tone_m
     }
     const float h_before = hsv_pixel.x;
 
+    // 2. Shadow desaturation: pre-curve, counteracts the saturation boost
+    //    introduced by the toe's non-linear per-channel compression.
+    //    Mirror of the natural highlight desaturation from the sigmoid shoulder.
+    if(params->shadow_desaturation > 0.0f)
+    {
+        const float Y_in = _agx_luminance_from_matrix(*rgb_in_out, rendering_to_xyz);
+        const float log_Y = _agx_apply_log_encoding(Y_in, params->range_in_ev, params->min_ev);
+
+        // Shadow mask: 1 at pure black, smoothly 0 at the pivot reference.
+        // Anchored to 18% gray (0 EV) by default, independent of pivot_x.
+        // shadow_desat_pivot_ev shifts the limit up (into midtones) or down (deeper shadows).
+        const float x_midgray = (-params->min_ev + params->shadow_desat_pivot_ev)
+                                / params->range_in_ev;
+        const float mask = 1.0f - smoothstep(0.0f, x_midgray, log_Y);
+        const float effective_desat = params->shadow_desaturation * mask;
+
+        if(effective_desat > 0.0f)
+        {
+            // pixel += effective_desat * (Y_in - pixel)  ≡  luma + (1-s)*(pixel-luma)
+            rgb_in_out->x = fma(effective_desat, Y_in - rgb_in_out->x, rgb_in_out->x);
+            rgb_in_out->y = fma(effective_desat, Y_in - rgb_in_out->y, rgb_in_out->y);
+            rgb_in_out->z = fma(effective_desat, Y_in - rgb_in_out->z, rgb_in_out->z);
+        }
+    }
+
+    // 3. Per-channel log-encode + tone mapping curve
     float4 transformed_pixel;
     transformed_pixel.x = _agx_apply_curve(_agx_apply_log_encoding(rgb_in_out->x, params->range_in_ev, params->min_ev), params);
     transformed_pixel.y = _agx_apply_curve(_agx_apply_log_encoding(rgb_in_out->y, params->range_in_ev, params->min_ev), params);
