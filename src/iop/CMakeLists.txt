@@ -63,6 +63,7 @@ endmacro (add_iop)
 
 # add_iop(useless "useless.c")
 add_iop(colorharmonizer "colorharmonizer.c" DEFAULT_VISIBLE)
+add_iop(coloruniformity "coloruniformity.c" DEFAULT_VISIBLE)
 add_iop(rawprepare "rawprepare.c")
 add_iop(soften "soften.c")
 add_iop(bloom "bloom.c")
