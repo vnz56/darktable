@@ -688,7 +688,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     {
       /* TODO: the use of bpc should be userconfigurable either from module or preference pane */
       /* softproof flag and black point compensation */
-      transformFlags |= cmsFLAGS_SOFTPROOFING | cmsFLAGS_NOCACHE | cmsFLAGS_BLACKPOINTCOMPENSATION;
+      transformFlags |= cmsFLAGS_SOFTPROOFING | cmsFLAGS_NOCACHE;
 
       if(d->mode == DT_PROFILE_GAMUTCHECK) transformFlags |= cmsFLAGS_GAMUTCHECK;
     }
