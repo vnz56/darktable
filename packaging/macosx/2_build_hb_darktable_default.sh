@@ -34,4 +34,4 @@ if [[ -d "$buildDir" ]]; then
 fi
 
 # Clean build here
-../../build.sh --install --build-generator Ninja --build-type Release --prefix "$installDir" -- $options
+../../build.sh --install --build-generator Ninja --build-type Release --enable-ai --prefix "$installDir" -- $options
