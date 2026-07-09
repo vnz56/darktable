@@ -17,6 +17,7 @@
 */
 
 #include "bauhaus/bauhaus.h"
+#include "common/colorspaces.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/custom_primaries.h"
 #include "common/image.h"
@@ -205,6 +206,7 @@ typedef struct dt_iop_agx_gui_data_t
   GtkWidget *completely_reverse_primaries;
   GtkWidget *post_curve_primaries_controls_vbox;
   GtkWidget *set_post_curve_primaries_from_pre_button;
+  GtkWidget *set_black_from_softproof_button;
 
   // --- Mouse interaction on the curve ---
   gboolean dragging;
@@ -2419,6 +2421,8 @@ static GtkWidget* _create_curve_graph_box(dt_iop_module_t *self,
   return graph_box;
 }
 
+static void _set_black_from_softproof_callback(GtkWidget *widget, dt_iop_module_t *self);
+
 static GtkWidget* _create_advanced_box(dt_iop_module_t *self,
                                        dt_iop_agx_gui_data_t *g)
 {
@@ -2468,6 +2472,20 @@ static GtkWidget* _create_advanced_box(dt_iop_module_t *self,
   dt_bauhaus_slider_set_factor(slider, 100.f);
   dt_bauhaus_slider_set_soft_range(slider, 0.f, 0.025f);
   gtk_widget_set_tooltip_text(slider, _("raise for a faded look"));
+
+  // Button: set 'target black' from the current soft-proof profile's paper black (Lmin)
+  g->set_black_from_softproof_button = gtk_button_new_with_label(_("set black from soft-proof profile"));
+  gtk_widget_set_tooltip_text(g->set_black_from_softproof_button,
+                              _("set 'target black' to the paper black (Lmin) of the current\n"
+                                "soft-proof profile, so shadows are lifted to the paper's black\n"
+                                "instead of being clipped. baked into the edit and applied on\n"
+                                "export; you can still fine-tune 'target black' afterwards."));
+  g_signal_connect(g->set_black_from_softproof_button, "clicked",
+                   G_CALLBACK(_set_black_from_softproof_callback), self);
+  dt_action_define_iop(self, NULL, N_("set black from soft-proof profile"),
+                       g->set_black_from_softproof_button, &dt_action_def_button);
+  gtk_box_pack_start(g->advanced_section.container,
+                     g->set_black_from_softproof_button, FALSE, FALSE, 0);
 
   // curve_gamma
   g->auto_gamma = dt_bauhaus_toggle_from_params(section, "auto_gamma");
@@ -2623,6 +2641,54 @@ static void _set_post_curve_primaries_from_pre_callback(GtkWidget *widget, dt_io
 
   dt_iop_gui_update(self);
   dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+// Set the curve's "target black" to the paper black (Lmin) of the current
+// soft-proof profile, so shadows are lifted to the paper's black instead of
+// being clipped. The value is baked into curve_target_display_black_ratio (an
+// ordinary parameter), so it lands in history/XMP and applies on export.
+static void _set_black_from_softproof_callback(GtkWidget *widget, dt_iop_module_t *self)
+{
+  dt_iop_agx_params_t *p = self->params;
+
+  // grab the currently selected soft-proof profile (same pattern as colorout.c)
+  const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
+      darktable.color_profiles->softproof_type,
+      darktable.color_profiles->softproof_filename,
+      DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
+
+  if(!prof || !prof->profile)
+  {
+    dt_control_log(_("AgX: no soft-proof profile is set"));
+    return;
+  }
+
+  // detect the paper black point; fall back to the media black point tag
+  cmsCIEXYZ black = { 0.0, 0.0, 0.0 };
+  gboolean ok = cmsDetectDestinationBlackPoint(&black, prof->profile, INTENT_RELATIVE_COLORIMETRIC, 0);
+  if(!ok)
+  {
+    cmsCIEXYZ *tag = cmsReadTag(prof->profile, cmsSigMediaBlackPointTag);
+    if(tag) { black = *tag; ok = TRUE; }
+  }
+  if(!ok)
+  {
+    dt_control_log(_("AgX: could not read the black point of the soft-proof profile"));
+    return;
+  }
+
+  // curve_target_display_black_ratio is the linear output black as a fraction of
+  // display/paper white, i.e. exactly the black point's Y (relative colorimetric).
+  const float y = CLAMPF((float)black.Y, 0.0f, 0.15f);
+  p->curve_target_display_black_ratio = y;
+
+  dt_iop_gui_update(self);
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+
+  dt_control_log(_("AgX target black set to %.2f%% from soft-proof profile '%s'"),
+                 y * 100.0f,
+                 dt_colorspaces_get_name(darktable.color_profiles->softproof_type,
+                                         darktable.color_profiles->softproof_filename));
 }
 
 typedef void (*hsv_updater_t)(dt_aligned_pixel_t hsv_out, float position_on_slider, float hue_deg, gboolean reverse_or_attenuate);
