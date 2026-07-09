@@ -307,7 +307,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
   const int width = roi_out->width;
   const int height = roi_out->height;
-  const float Lwhite = Y_to_dt_UCS_L_star(1.0f);
 
   // Pre-computed matrices
   dt_colormatrix_t mat_xyz_to_lms, mat_lms_to_xyz;
@@ -342,27 +341,25 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         continue;
       }
 
-      // --- A. CONVERT TO HYBRID COLOR SPACES ---
-      dt_aligned_pixel_t px_xyz, px_xyz_d65, px_xyY, px_JCH;
+      // --- A. CONVERT TO WORKING SPACE (Filmlight Yrg Ych, unified) ---
+      dt_aligned_pixel_t px_xyz, px_xyz_d65;
       dt_apply_transposed_color_matrix(px_rgb, wp->matrix_in_transposed, px_xyz);
       XYZ_D50_to_D65(px_xyz, px_xyz_d65);
 
-      // UCS JCH (for hue)
-      dt_D65_XYZ_to_xyY(px_xyz_d65, px_xyY);
-      xyY_to_dt_UCS_JCH(px_xyY, Lwhite, px_JCH);
-      const float h_pix = wrap_hue(px_JCH[2] / (2.0f * M_PI_F));
-
-      // Filmlight Yrg (for chroma and luminance)
+      // Filmlight Yrg: luminance + chromaticity (r,g)
       dt_aligned_pixel_t px_lms, px_yrg;
       dt_apply_transposed_color_matrix(px_xyz_d65, mat_xyz_to_lms, px_lms);
       LMS_to_Yrg(px_lms, px_yrg);
-      
+
       const float Y_pix = px_yrg[0];
 
-      // Pixel chroma (distance to D65 neutral)
+      // Pixel chroma (distance to D65 neutral in the r,g plane)
       const float dr_pix = px_yrg[1] - rn;
       const float dg_pix = px_yrg[2] - gn;
       const float c_pix = sqrtf(dr_pix*dr_pix + dg_pix*dg_pix);
+
+      // Yrg hue: angle in the r,g plane around D65 neutral, in [0,1] turns
+      const float h_pix = wrap_hue(atan2f(dg_pix, dr_pix) / (2.0f * M_PI_F));
 
       // --- B. SELECTION WEIGHT COMPUTATION ---
       float weight = compute_affinity_weight(
@@ -810,14 +807,9 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
 
   dt_aligned_pixel_t px_rgb = {self->picked_color[0], self->picked_color[1], self->picked_color[2], 0.0f};
   
-  dt_aligned_pixel_t px_xyz, px_xyz_d65, px_xyY, px_JCH;
+  dt_aligned_pixel_t px_xyz, px_xyz_d65;
   dt_apply_transposed_color_matrix(px_rgb, wp->matrix_in_transposed, px_xyz);
   XYZ_D50_to_D65(px_xyz, px_xyz_d65);
-
-  const float Lwhite = Y_to_dt_UCS_L_star(1.0f);
-  dt_D65_XYZ_to_xyY(px_xyz_d65, px_xyY);
-  xyY_to_dt_UCS_JCH(px_xyY, Lwhite, px_JCH);
-  const float h_picked = wrap_hue(px_JCH[2] / (2.0f * M_PI_F));
 
   dt_colormatrix_t mat_xyz_to_lms;
   dt_colormatrix_transpose(mat_xyz_to_lms, XYZ_D65_to_LMS_2006_D65);
@@ -834,6 +826,8 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
   const float dr = px_yrg[1] - d65_yrg[1];
   const float dg = px_yrg[2] - d65_yrg[2];
   const float c_picked = sqrtf(dr*dr + dg*dg);
+  // Yrg hue of the picked color (same metric as process())
+  const float h_picked = wrap_hue(atan2f(dg, dr) / (2.0f * M_PI_F));
 
   ++darktable.gui->reset;
   if(picker == g->source_hue_picker) {
