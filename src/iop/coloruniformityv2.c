@@ -34,15 +34,6 @@ V8 - Additions over V7:
 #include <stdlib.h>
 #include <string.h>
 
-// Preview modes (for vectorscope and mask display)
-typedef enum {
-    PREVIEW_NONE             = 0,
-    PREVIEW_MASK             = 1,
-    PREVIEW_DELTA_MASK       = 2,  // Coloured mask: selection weight + correction amplitude
-    PREVIEW_OVERLAY_BEFORE   = 3,
-    PREVIEW_OVERLAY          = 4,
-    PREVIEW_DELTA            = 5
-} dt_iop_coloruniformityv2_preview_mode_t;
 
 // --- 1. PARAMETERS AND INTROSPECTION (VERSION 12) ---
 
@@ -55,24 +46,12 @@ typedef struct dt_iop_coloruniformityv2_params_t {
   float source_chroma;     // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 0.20 $DESCRIPTION: "Source Chroma"
   float source_lightness;  // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 0.50 $DESCRIPTION: "Source Lightness"
 
-  // --- SELECTION: parametric ranges, 4 handles [edge_lo, in_lo, in_hi, edge_hi] ---
-  // Each on the channel's normalized [0,1] axis (see process() for axis mappings).
-  // Trapezoid factor a la darktable parametric mask (_blendif_compute_factor).
-  // HUE: circular, symmetric arc = center + plateau half-width + falloff half-width.
-  // (Handles wrapping natively; default = whole circle.)
-  float hue_center;        // $MIN: 0.0 $MAX: 1.0  $DEFAULT: 0.08 $DESCRIPTION: "hue center"
-  float hue_plateau;       // $MIN: 0.0 $MAX: 0.5  $DEFAULT: 0.5  $DESCRIPTION: "hue plateau half-width"
-  float hue_falloff;       // $MIN: 0.0 $MAX: 0.5  $DEFAULT: 0.0  $DESCRIPTION: "hue falloff half-width"
-  // CHROMA axis (c_pix / C_MAX) -- default: exclude near-neutral, no upper limit
-  float chroma_h0;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.02 $DESCRIPTION: "chroma edge low"
-  float chroma_h1;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.05 $DESCRIPTION: "chroma low"
-  float chroma_h2;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0  $DESCRIPTION: "chroma high"
-  float chroma_h3;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0  $DESCRIPTION: "chroma edge high"
-  // LIGHTNESS axis (perceptual, [0,1]) -- default: full range
-  float light_h0;          // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0  $DESCRIPTION: "lightness edge low"
-  float light_h1;          // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0  $DESCRIPTION: "lightness low"
-  float light_h2;          // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0  $DESCRIPTION: "lightness high"
-  float light_h3;          // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0  $DESCRIPTION: "lightness edge high"
+  // --- REACH ("portée"): color-distance from the source over which the correction
+  // acts (soft falloff to 0). Not a selection -- the darktable blend mask decides
+  // WHERE; reach shapes HOW the (global) correction fades by color around the source.
+  float reach_h;           // $MIN: 0.01 $MAX: 0.5 $DEFAULT: 0.15 $DESCRIPTION: "hue reach"
+  float reach_c;           // $MIN: 0.01 $MAX: 1.5 $DEFAULT: 0.5  $DESCRIPTION: "chroma reach"
+  float reach_l;           // $MIN: 0.1  $MAX: 6.0 $DEFAULT: 2.0  $DESCRIPTION: "lightness reach"
 
   // --- CORRECTION (Target T) ---
   float target_hue;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.12 $DESCRIPTION: "Target Hue"
@@ -106,7 +85,6 @@ typedef struct dt_iop_coloruniformityv2_params_t {
   int bypass_luma;         // $MIN: 0 $MAX: 1 $DEFAULT: 0 $DESCRIPTION: "Bypass Luma"
 
   // --- UI STATE ---
-  int preview_mode;        // $MIN: 0 $MAX: 5 $DEFAULT: 0 $DESCRIPTION: "Preview Mode"
 
   // --- V12: ASYMMETRIC PRIORITY (P0) ---
   float priority_h;          // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "Hue Priority"
@@ -128,16 +106,10 @@ DT_MODULE_INTROSPECTION(1, dt_iop_coloruniformityv2_params_t)
 
 typedef struct dt_iop_coloruniformityv2_gui_data_t {
   // Selection (parametric ranges, darktable-style 4-handle sliders)
-  GtkWidget *source_hue_picker;   // standalone pipette: sets anchor + recenters ranges
-  // hue: symmetric circular arc -- colored center line + collapsible ring
-  GtkWidget *hue_center;
-  GtkWidget *hue_plateau;
-  GtkWidget *hue_falloff;
-  dt_gui_collapsible_section_t hue_ring_section;
-  GtkWidget *hue_ring_area;
-  int ring_drag;   // 0 none, 1 center, 2 plateau edge, 3 falloff edge
-  GtkWidget *chroma_slider;       // 4-handle gradient slider (chroma)
-  GtkWidget *light_slider;        // 4-handle gradient slider (lightness)
+  GtkWidget *source_hue_picker;   // standalone pipette: sets the source reference
+  GtkWidget *reach_h;
+  GtkWidget *reach_c;
+  GtkWidget *reach_l;
 
   // Correction
   GtkWidget *target_hue_picker;
@@ -170,7 +142,6 @@ typedef struct dt_iop_coloruniformityv2_gui_data_t {
   GtkWidget *offsets_weighted_combo;
 
   GtkWidget *btn_bypass_hue, *btn_bypass_chroma, *btn_bypass_luma;
-  GtkWidget *preview_mode_combo;
   
   GtkNotebook *notebook;
   
@@ -224,67 +195,19 @@ static inline gboolean _rgb_invalid(const dt_aligned_pixel_t rgb) {
          rgb[0] < -1e-3f || rgb[1] < -1e-3f || rgb[2] < -1e-3f;
 }
 
-// --- Selection engine: parametric ranges (darktable-style 4-handle trapezoid) ---
-
-// Chroma axis: normalize Yrg chroma to the channel's [0,1] display axis.
-#define CU2_CHROMA_MAX 0.7f
-static inline float _chroma_axis(const float c) { return CLAMPF(c / CU2_CHROMA_MAX, 0.0f, 1.0f); }
-// Lightness axis: perceptual dt UCS L* (display lightness), normalized to white=1.
-// (UCS is used here for LUMA only; the hue metric is Yrg -- see process().)
-static inline float _light_axis(const float Y)
-{
-  return CLAMPF(Y_to_dt_UCS_L_star(fmaxf(Y, 0.0f)) / Y_to_dt_UCS_L_star(1.0f), 0.0f, 1.0f);
-}
-
-// Linear trapezoid factor from 4 handles [p0 edge_lo, p1 in_lo, p2 in_hi, p3 edge_hi].
-// (Same shape as darktable's _blendif_compute_factor.)
-static inline float _param_factor(float v, const float p0, const float p1,
-                                  const float p2, const float p3)
-{
-  v = CLAMPF(v, 0.0f, 1.0f);
-  float f = 1.0f;
-  // low side: only cuts if the low handles are above 0 (handle at 0 => no low cut,
-  // so clamped extremes and full-range selections pass through)
-  if(v < p1) f = (v <= p0) ? 0.0f : (v - p0) / fmaxf(p1 - p0, 1e-6f);
-  // high side: only cuts if the high handles are below 1 (handle at 1 => no high cut)
-  if(v > p2)
-  {
-    const float hf = (v >= p3) ? 0.0f : 1.0f - (v - p2) / fmaxf(p3 - p2, 1e-6f);
-    f = fminf(f, hf);
-  }
-  return f;
-}
-
-// Hue: symmetric circular arc. 1 within the plateau half-width of the center,
-// linear ramp to 0 over the falloff half-width, 0 beyond. Wraps natively.
-static inline float _hue_arc_factor(const float h, const float center,
-                                    const float plateau, const float falloff)
-{
-  const float d = fabsf(hue_dist(h, center)); // circular distance in [0, 0.5]
-  if(d <= plateau) return 1.0f;
-  if(d >= plateau + falloff) return 0.0f;
-  return 1.0f - (d - plateau) / fmaxf(falloff, 1e-6f);
-}
-
-// Full selection weight = hue arc factor x chroma trapezoid x lightness trapezoid.
-static inline float compute_selection_weight(
-    const float h_pix, const float chroma_axis, const float light_axis,
-    const float hue_center, const float hue_plateau, const float hue_falloff,
-    const float *const chroma_h, const float *const light_h)
-{
-  const float fh = _hue_arc_factor(h_pix, hue_center, hue_plateau, hue_falloff);
-  if(fh <= 0.0f) return 0.0f;
-  const float fc = _param_factor(chroma_axis, chroma_h[0], chroma_h[1], chroma_h[2], chroma_h[3]);
-  if(fc <= 0.0f) return 0.0f;
-  const float fl = _param_factor(light_axis, light_h[0], light_h[1], light_h[2], light_h[3]);
-  return fh * fc * fl;
-}
-
 // Apply affinity (peak or donut) to a base weight, per component.
 // base_weight: raw selection (pizza slice * luma)
 // affinity > 0 -> peak (reinforces center)
 // affinity < 0 -> donut (hollows out center)
 // preserve: neutral zone radius for donut mode
+// Reach window: 1 at the source (t=0), smoothly to 0 at t>=1 (the reach edge).
+static inline float _reach_window(const float t)
+{
+  if(t >= 1.0f) return 0.0f;
+  const float s = 1.0f - t;
+  return s * s * (3.0f - 2.0f * s); // smoothstep
+}
+
 // t_norm: per-component normalized distance (0 = center, ~1 = edge)
 static inline float apply_affinity(const float base_weight, const float affinity,
                                    const float preserve, const float t_norm)
@@ -318,11 +241,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   dt_colormatrix_transpose(mat_xyz_to_lms, XYZ_D65_to_LMS_2006_D65);
   dt_colormatrix_transpose(mat_lms_to_xyz, LMS_2006_D65_to_XYZ_D65);
 
-  // Checker pattern for PREVIEW_OVERLAY
-  const size_t checker_size = MAX((size_t)DT_PIXEL_APPLY_DPI(8), (size_t)2);
-  const size_t checker_period = 2 * checker_size;
-  const float checker_dark  = 0.18f;
-  const float checker_light = 0.45f;
 
   // D65 neutral point in the (r, g) plane of Yrg space.
   const dt_aligned_pixel_t d65_xyz = {0.95047f, 1.0f, 1.08883f, 0.0f};
@@ -366,58 +284,19 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
       // Yrg hue: angle in the r,g plane around D65 neutral, in [0,1] turns
       const float h_pix = wrap_hue(atan2f(dg_pix, dr_pix) / (2.0f * M_PI_F));
 
-      // --- B. SELECTION WEIGHT (parametric ranges: product of 3 trapezoid factors) ---
-      // Neutral protection is now implicit in the chroma channel's low handles.
-      const float chroma_axis = _chroma_axis(c_pix);
-      const float light_axis  = _light_axis(Y_pix);
-      const float chroma_h[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
-      const float light_h[4]  = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
-      float weight = compute_selection_weight(h_pix, chroma_axis, light_axis,
-                                              p->hue_center, p->hue_plateau, p->hue_falloff,
-                                              chroma_h, light_h);
+      // --- B. REACH ("portée"): soft colour window around the source. This is the
+      // correction's colour extent (applied globally); the darktable blend mask
+      // decides WHERE in the image the effect is kept. Distances in native units.
+      const float t_norm_h = fabsf(hue_dist(h_pix, p->source_hue)) / fmaxf(p->reach_h, 1e-3f);
+      const float t_norm_c = fabsf(c_pix - p->source_chroma) / fmaxf(p->reach_c, 1e-3f);
+      const float t_norm_l = fabsf(log2f(fmaxf(Y_pix, 1e-6f)) - log2f(fmaxf(p->source_lightness, 1e-6f)))
+                           / fmaxf(p->reach_l, 1e-3f);
+      float weight = _reach_window(t_norm_h) * _reach_window(t_norm_c) * _reach_window(t_norm_l);
 
-      // --- Per-component normalized distance for affinity (relative to the source anchor,
-      // normalized by the selection range half-width on each channel's axis) ---
-      const float hw_h = fmaxf(p->hue_plateau + p->hue_falloff, 1e-3f);
-      const float t_norm_h = fabsf(hue_dist(h_pix, p->source_hue)) / hw_h;
-      const float hw_c = fmaxf((chroma_h[3] - chroma_h[0]) * 0.5f, 1e-3f);
-      const float t_norm_c = fabsf(chroma_axis - _chroma_axis(p->source_chroma)) / hw_c;
-      const float hw_l = fmaxf((light_h[3] - light_h[0]) * 0.5f, 1e-3f);
-      const float t_norm_l = fabsf(light_axis - _light_axis(p->source_lightness)) / hw_l;
-
-      // --- EARLY EXIT ---
-      if (weight < 1e-4f) {
-        switch(p->preview_mode) {
-          case PREVIEW_MASK:
-            for(int c = 0; c < 3; c++) out_ptr[c] = 0.0f;
-            break;
-          case PREVIEW_OVERLAY:
-          case PREVIEW_OVERLAY_BEFORE: {
-            const gboolean row_odd = ((size_t)j % checker_period) < checker_size;
-            const gboolean col_odd = ((size_t)i % checker_period) < checker_size;
-            const float checker = (row_odd ^ col_odd) ? checker_light : checker_dark;
-            for(int c = 0; c < 3; c++) out_ptr[c] = checker;
-            break;
-          }
-          case PREVIEW_DELTA:
-            // Neutral grey: no correction on this pixel
-            out_ptr[0] = out_ptr[1] = out_ptr[2] = 0.18f;
-            break;
-          case PREVIEW_DELTA_MASK:
-            // Black: pixel outside selection
-            out_ptr[0] = out_ptr[1] = out_ptr[2] = 0.0f;
-            break;
-          default: // PREVIEW_NONE
-            for(int c = 0; c < 3; c++) out_ptr[c] = in_ptr[c];
-            break;
-        }
-        out_ptr[3] = in_ptr[3];
-        continue;
-      }
-      // Passthrough if no corrections configured and no preview
-      if (p->preview_mode == PREVIEW_NONE
-          && p->strength_h == 0.f && p->strength_c == 0.f && p->strength_l == 0.f
-          && p->offset_h == 0.f   && p->offset_c == 0.f   && p->offset_l == 0.f) {
+      // Passthrough if outside the reach or nothing configured
+      if (weight < 1e-4f
+          || (p->strength_h == 0.f && p->strength_c == 0.f && p->strength_l == 0.f
+              && p->offset_h == 0.f && p->offset_c == 0.f && p->offset_l == 0.f)) {
         for(int c = 0; c < 4; c++) out_ptr[c] = in_ptr[c];
         continue;
       }
@@ -458,7 +337,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         // P2: Texture preservation (convergence only)
         if(p->preserve_texture_h > 0.0f && p->strength_h >= 0.0f)
         {
-          const float d_norm = fabsf(hue_dist(h_pix, p->target_hue)) / hw_h;
+          const float d_norm = fabsf(hue_dist(h_pix, p->target_hue)) / fmaxf(p->reach_h, 1e-3f);
           delta_h *= 1.0f - p->preserve_texture_h * expf(-d_norm * d_norm * 8.0f);
         }
 
@@ -558,8 +437,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         // P2: Texture preservation
         if(p->preserve_texture_l > 0.0f && p->strength_l >= 0.0f)
         {
-          // approximate EV span of the lightness selection (full [0,1] axis ~ 6 EV)
-          const float range = fmaxf((light_h[3] - light_h[0]) * 6.0f, 1e-3f);
+          const float range = fmaxf(p->reach_l, 1e-3f);
           const float d_norm = fabsf(log_Y - log_target) / range;
           delta_l *= 1.0f - p->preserve_texture_l * expf(-d_norm * d_norm * 8.0f);
         }
@@ -591,56 +469,9 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
       dt_apply_transposed_color_matrix(px_xyz, wp->matrix_out_transposed, px_rgb_out);
       for(int c = 0; c < 3; c++) px_rgb_out[c] = fminf(px_rgb_out[c], 1e6f);
 
-      // UI preview modes
-      if (p->preview_mode == PREVIEW_MASK) {
-        for(int c = 0; c < 3; c++) out_ptr[c] = weight;
-      }
-      else if (p->preview_mode == PREVIEW_OVERLAY || p->preview_mode == PREVIEW_OVERLAY_BEFORE) {
-        const gboolean row_odd = ((size_t)j % checker_period) < checker_size;
-        const gboolean col_odd = ((size_t)i % checker_period) < checker_size;
-        const float checker = (row_odd ^ col_odd) ? checker_light : checker_dark;
-        const float w_comp = 1.0f - weight;
-        const float *src = (p->preview_mode == PREVIEW_OVERLAY) ? px_rgb_out : in_ptr;
-        for(int c = 0; c < 3; c++)
-          out_ptr[c] = w_comp * checker + weight * src[c];
-      }
-      else if (p->preview_mode == PREVIEW_DELTA) {
-        // Delta visualisation: shows the corrected colour of each selected pixel,
-        // with brightness proportional to the actual correction amplitude.
-        // Unselected pixels and pixels with no active correction → neutral grey.
-        // This way: hue = real corrected hue (no angular convention issues),
-        //           brightness = how much the pixel is actually being moved.
-        const float delta_c = c_corr - c_base;
-        const float amp_h = fabsf(delta_h);
-        const float amp_c = fabsf(delta_c) / fmaxf(p->source_chroma, 0.01f);
-        const float amplitude = fminf((amp_h * 3.0f + amp_c) * weight, 1.0f);
-
-        if(amplitude < 1e-4f)
-        {
-          // No correction active — neutral grey
-          out_ptr[0] = out_ptr[1] = out_ptr[2] = 0.18f;
-        }
-        else
-        {
-          // Blend corrected colour toward grey based on amplitude:
-          // amplitude=1 → full corrected colour; amplitude→0 → grey
-          const float grey = 0.18f;
-          for(int c = 0; c < 3; c++)
-            out_ptr[c] = CLAMPF(grey + amplitude * (px_rgb_out[c] - grey), 0.0f, 1.0f);
-        }
-      }
-      else if (p->preview_mode == PREVIEW_DELTA_MASK) {
-        // Coloured mask: black outside selection (early exit), inside:
-        //   colour     = actual corrected RGB of the pixel (immediately readable)
-        //   brightness = selection weight (bright = strongly selected)
-        // This shows exactly what colour each selected pixel is being pushed toward.
-        const float J_scale = weight * 1.4f; // boost to make it visible
-        for(int c = 0; c < 3; c++)
-          out_ptr[c] = CLAMPF(px_rgb_out[c] * J_scale, 0.0f, 1.0f);
-      }
-      else {
-        for(int c = 0; c < 3; c++) out_ptr[c] = px_rgb_out[c]; // PREVIEW_NONE
-      }
+      // Output the (globally) corrected pixel. The darktable blend mask decides
+      // where this is kept vs. the input.
+      for(int c = 0; c < 3; c++) out_ptr[c] = px_rgb_out[c];
       out_ptr[3] = in_ptr[3];
     }
   }
@@ -791,15 +622,6 @@ static void _shift_hue_cb(GtkWidget *widget, gpointer user_data)
 
 // --- GUI CALLBACKS ---
 
-// Recenter a linear 4-handle range so its plateau center -> target, keeping widths (clamped to [0,1]).
-static inline void _recenter_linear(float *h, const float target)
-{
-  const float center = 0.5f * (h[1] + h[2]);
-  float d = target - center;
-  // limit shift so handles stay in [0,1] without collapsing the shape
-  d = CLAMPF(d, -h[0], 1.0f - h[3]);
-  for(int i = 0; i < 4; i++) h[i] = CLAMPF(h[i] + d, 0.0f, 1.0f);
-}
 void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpipe_t *pipe)
 {
   dt_iop_coloruniformityv2_params_t *p = (dt_iop_coloruniformityv2_params_t *)self->params;
@@ -837,21 +659,6 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
     p->source_hue = h_picked;
     p->source_chroma = c_picked;
     p->source_lightness = Y_picked;
-    // hue: center the arc on the picked hue (widths kept)
-    p->hue_center = h_picked;
-    dt_bauhaus_slider_set(g->hue_center, p->hue_center);
-    gtk_widget_queue_draw(g->hue_ring_area);
-    // chroma / lightness: recenter the linear ranges on the picked color (widths kept)
-    float ch[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
-    _recenter_linear(ch, _chroma_axis(c_picked));
-    p->chroma_h0 = ch[0]; p->chroma_h1 = ch[1]; p->chroma_h2 = ch[2]; p->chroma_h3 = ch[3];
-    float lh[4] = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
-    _recenter_linear(lh, _light_axis(Y_picked));
-    p->light_h0 = lh[0]; p->light_h1 = lh[1]; p->light_h2 = lh[2]; p->light_h3 = lh[3];
-    double dc[4] = { ch[0], ch[1], ch[2], ch[3] };
-    double dl[4] = { lh[0], lh[1], lh[2], lh[3] };
-    dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->chroma_slider), dc);
-    dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->light_slider), dl);
   } else if(picker == g->target_hue_picker) {
     p->target_hue = h_picked;
     p->target_chroma = c_picked;
@@ -874,10 +681,10 @@ static void _slider_changed_cb(GtkWidget *widget, gpointer user_data) {
   
   const float val = dt_bauhaus_slider_get(widget);
   
-  // Hue arc (chroma/lightness ranges are handled by _range_changed_cb)
-  if (widget == g->hue_center)  { p->hue_center = val;  gtk_widget_queue_draw(g->hue_ring_area); }
-  else if (widget == g->hue_plateau) { p->hue_plateau = val; gtk_widget_queue_draw(g->hue_ring_area); }
-  else if (widget == g->hue_falloff) { p->hue_falloff = val; gtk_widget_queue_draw(g->hue_ring_area); }
+  // Reach (correction colour extent)
+  if (widget == g->reach_h) p->reach_h = val;
+  else if (widget == g->reach_c) p->reach_c = val;
+  else if (widget == g->reach_l) p->reach_l = val;
   // Correction
   else if (widget == g->target_hue_slider) {
     p->target_hue = val;
@@ -909,13 +716,6 @@ static void _slider_changed_cb(GtkWidget *widget, gpointer user_data) {
   dt_dev_add_history_item(self->dev, self, TRUE);
 }
 
-static void _preview_mode_changed_cb(GtkComboBox *widget, gpointer user_data) {
-  if (darktable.gui->reset) return;
-  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
-  dt_iop_coloruniformityv2_params_t *p = (dt_iop_coloruniformityv2_params_t *)self->params;
-  p->preview_mode = gtk_combo_box_get_active(widget);
-  dt_dev_add_history_item(self->dev, self, TRUE);
-}
 
 static void _offsets_weighted_changed_cb(GtkComboBox *widget, gpointer user_data) {
   if (darktable.gui->reset) return;
@@ -975,16 +775,10 @@ void gui_update(dt_iop_module_t *self) {
   dt_iop_coloruniformityv2_params_t *p = self->params;
   ++darktable.gui->reset;
   
-  // Hue arc (center line + ring)
-  dt_bauhaus_slider_set(g->hue_center, p->hue_center);
-  dt_bauhaus_slider_set(g->hue_plateau, p->hue_plateau);
-  dt_bauhaus_slider_set(g->hue_falloff, p->hue_falloff);
-  if(g->hue_ring_area) gtk_widget_queue_draw(g->hue_ring_area);
-  // Chroma / lightness ranges (4-handle gradient sliders)
-  double dc[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
-  double dl[4] = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
-  dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->chroma_slider), dc);
-  dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->light_slider), dl);
+  // Reach (correction colour extent)
+  dt_bauhaus_slider_set(g->reach_h, p->reach_h);
+  dt_bauhaus_slider_set(g->reach_c, p->reach_c);
+  dt_bauhaus_slider_set(g->reach_l, p->reach_l);
   // Correction
   dt_bauhaus_slider_set(g->target_hue_slider, p->target_hue);
   dt_bauhaus_slider_set(g->target_chroma, p->target_chroma);
@@ -1010,8 +804,6 @@ void gui_update(dt_iop_module_t *self) {
   dt_bauhaus_slider_set(g->offset_l, p->offset_l);
   gtk_combo_box_set_active(GTK_COMBO_BOX(g->offsets_weighted_combo), p->offsets_weighted);
 
-  gtk_combo_box_set_active(GTK_COMBO_BOX(g->preview_mode_combo), p->preview_mode);
-
   // Bypass buttons
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->btn_bypass_hue),    p->bypass_hue);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->btn_bypass_chroma), p->bypass_chroma);
@@ -1033,166 +825,6 @@ static GtkWidget *_create_manual_slider(dt_iop_module_t *self, const char *label
   return slider;
 }
 
-// --- Parametric range slider (darktable-style 4-handle gradient slider) ---
-static void _range_changed_cb(GtkWidget *widget, gpointer user_data)
-{
-  dt_iop_module_t *self = user_data;
-  if(darktable.gui->reset) return;
-  dt_iop_coloruniformityv2_params_t *p = self->params;
-  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
-  double v[4];
-  dtgtk_gradient_slider_multivalue_get_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(widget), v);
-  if(widget == g->chroma_slider)
-  { p->chroma_h0 = v[0]; p->chroma_h1 = v[1]; p->chroma_h2 = v[2]; p->chroma_h3 = v[3]; }
-  else if(widget == g->light_slider)
-  { p->light_h0 = v[0]; p->light_h1 = v[1]; p->light_h2 = v[2]; p->light_h3 = v[3]; }
-  dt_dev_add_history_item(darktable.develop, self, TRUE);
-}
-
-static GtkWidget *_create_range_slider(dt_iop_module_t *self)
-{
-  GtkWidget *w = dtgtk_gradient_slider_multivalue_new_with_name(4, "coloruniformityv2-range");
-  GtkDarktableGradientSlider *s = DTGTK_GRADIENT_SLIDER_MULTIVALUE(w);
-  // 2 outer open handles (falloff edges) + 2 inner filled handles (plateau)
-  dtgtk_gradient_slider_multivalue_set_marker(s, GRADIENT_SLIDER_MARKER_LOWER_OPEN_BIG, 0);
-  dtgtk_gradient_slider_multivalue_set_marker(s, GRADIENT_SLIDER_MARKER_UPPER_FILLED_BIG, 1);
-  dtgtk_gradient_slider_multivalue_set_marker(s, GRADIENT_SLIDER_MARKER_UPPER_FILLED_BIG, 2);
-  dtgtk_gradient_slider_multivalue_set_marker(s, GRADIENT_SLIDER_MARKER_LOWER_OPEN_BIG, 3);
-  dtgtk_gradient_slider_multivalue_set_increment(s, 0.001);
-  g_signal_connect(G_OBJECT(w), "value-changed", G_CALLBACK(_range_changed_cb), self);
-  return w;
-}
-
-// ============================ HUE RING WIDGET ============================
-// Symmetric circular arc: center + plateau half-width + falloff half-width.
-// hue in [0,1] turns -> screen angle a = hue*2pi ; point = (cx+r cos a, cy+r sin a).
-
-static inline void _ring_geom(GtkWidget *w, double *cx, double *cy, double *rout, double *rin)
-{
-  GtkAllocation a; gtk_widget_get_allocation(w, &a);
-  *cx = a.width * 0.5; *cy = a.height * 0.5;
-  *rout = fmin(a.width, a.height) * 0.5 - 6.0;
-  *rin = *rout * 0.66;
-}
-
-static gboolean _hue_ring_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
-{
-  dt_iop_module_t *self = user_data;
-  dt_iop_coloruniformityv2_params_t *p = self->params;
-  double cx, cy, rout, rin;
-  _ring_geom(widget, &cx, &cy, &rout, &rin);
-  const double rmid = 0.5 * (rout + rin);
-
-  // 1. hue ring (thick coloured segments)
-  const int N = 240;
-  cairo_set_line_width(cr, rout - rin);
-  for(int i = 0; i < N; i++)
-  {
-    const double h0 = (double)i / N, h1 = (double)(i + 1) / N;
-    float r, g, b; _hue_to_rgb((float)(0.5 * (h0 + h1)), &r, &g, &b);
-    cairo_set_source_rgb(cr, r, g, b);
-    cairo_new_sub_path(cr);
-    cairo_arc(cr, cx, cy, rmid, h0 * 2.0 * M_PI, h1 * 2.0 * M_PI);
-    cairo_stroke(cr);
-  }
-
-  // 2. selected arc overlay: plateau (opaque white edge) + falloff (fading)
-  const double ap = p->hue_center * 2.0 * M_PI;
-  const double plat = p->hue_plateau * 2.0 * M_PI;
-  const double fall = p->hue_falloff * 2.0 * M_PI;
-  // dim the unselected part with a translucent veil, then leave selected bright
-  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.55);
-  cairo_set_line_width(cr, rout - rin + 2.0);
-  cairo_new_sub_path(cr);
-  cairo_arc(cr, cx, cy, rmid, ap + plat + fall, ap - plat - fall + 2.0 * M_PI);
-  cairo_stroke(cr);
-
-  // 3. handles: center tick + plateau/falloff markers (both sides)
-  cairo_set_line_width(cr, 2.0);
-  for(int s = -1; s <= 1; s += 2)
-  {
-    // plateau edge
-    const double aP = ap + s * plat;
-    cairo_set_source_rgb(cr, 1, 1, 1);
-    cairo_new_sub_path(cr); cairo_arc(cr, cx + rmid * cos(aP), cy + rmid * sin(aP), 4.0, 0, 2 * M_PI); cairo_fill(cr);
-    // falloff edge
-    const double aF = ap + s * (plat + fall);
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.6);
-    cairo_new_sub_path(cr); cairo_arc(cr, cx + rmid * cos(aF), cy + rmid * sin(aF), 3.0, 0, 2 * M_PI); cairo_stroke(cr);
-  }
-  // center marker (radial line)
-  cairo_set_source_rgb(cr, 1, 1, 1);
-  cairo_set_line_width(cr, 2.0);
-  cairo_move_to(cr, cx + (rin - 2) * cos(ap), cy + (rin - 2) * sin(ap));
-  cairo_line_to(cr, cx + (rout + 2) * cos(ap), cy + (rout + 2) * sin(ap));
-  cairo_stroke(cr);
-  return FALSE;
-}
-
-// map mouse to hue + whether within the ring band
-static gboolean _ring_hue_at(GtkWidget *w, double mx, double my, float *hue)
-{
-  double cx, cy, rout, rin; _ring_geom(w, &cx, &cy, &rout, &rin);
-  const double dx = mx - cx, dy = my - cy, r = hypot(dx, dy);
-  *hue = wrap_hue((float)(atan2(dy, dx) / (2.0 * M_PI)));
-  return (r > rin - 12.0 && r < rout + 12.0);
-}
-
-static void _ring_sync(dt_iop_module_t *self)
-{
-  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
-  dt_iop_coloruniformityv2_params_t *p = self->params;
-  ++darktable.gui->reset;
-  dt_bauhaus_slider_set(g->hue_center, p->hue_center);
-  dt_bauhaus_slider_set(g->hue_plateau, p->hue_plateau);
-  dt_bauhaus_slider_set(g->hue_falloff, p->hue_falloff);
-  --darktable.gui->reset;
-  gtk_widget_queue_draw(g->hue_ring_area);
-}
-
-static gboolean _hue_ring_press(GtkWidget *widget, GdkEventButton *ev, gpointer user_data)
-{
-  dt_iop_module_t *self = user_data;
-  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
-  dt_iop_coloruniformityv2_params_t *p = self->params;
-  float h; if(!_ring_hue_at(widget, ev->x, ev->y, &h)) return FALSE;
-  const float d = fabsf(hue_dist(h, p->hue_center));
-  const float e_p = p->hue_plateau, e_f = p->hue_plateau + p->hue_falloff;
-  if(d < fmaxf(e_p * 0.5f, 0.02f)) g->ring_drag = 1;              // center
-  else if(fabsf(d - e_p) <= fabsf(d - e_f)) g->ring_drag = 2;     // plateau edge
-  else g->ring_drag = 3;                                          // falloff edge
-  // apply immediately
-  if(g->ring_drag == 1) p->hue_center = h;
-  else if(g->ring_drag == 2) p->hue_plateau = CLAMPF(d, 0.0f, 0.5f - p->hue_falloff);
-  else p->hue_falloff = CLAMPF(d - p->hue_plateau, 0.0f, 0.5f - p->hue_plateau);
-  _ring_sync(self);
-  dt_dev_add_history_item(darktable.develop, self, TRUE);
-  return TRUE;
-}
-
-static gboolean _hue_ring_motion(GtkWidget *widget, GdkEventMotion *ev, gpointer user_data)
-{
-  dt_iop_module_t *self = user_data;
-  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
-  dt_iop_coloruniformityv2_params_t *p = self->params;
-  if(!g->ring_drag) return FALSE;
-  float h; _ring_hue_at(widget, ev->x, ev->y, &h);
-  const float d = fabsf(hue_dist(h, p->hue_center));
-  if(g->ring_drag == 1) p->hue_center = h;
-  else if(g->ring_drag == 2) p->hue_plateau = CLAMPF(d, 0.0f, 0.5f - p->hue_falloff);
-  else p->hue_falloff = CLAMPF(d - p->hue_plateau, 0.0f, 0.5f - p->hue_plateau);
-  _ring_sync(self);
-  dt_dev_add_history_item(darktable.develop, self, TRUE);
-  return TRUE;
-}
-
-static gboolean _hue_ring_release(GtkWidget *widget, GdkEventButton *ev, gpointer user_data)
-{
-  dt_iop_module_t *self = user_data;
-  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
-  g->ring_drag = 0;
-  return TRUE;
-}
 
 void gui_init(dt_iop_module_t *self)
 {
@@ -1202,110 +834,38 @@ void gui_init(dt_iop_module_t *self)
   g->notebook = dt_ui_notebook_new(&notebook_def);
   dt_action_define_iop(self, NULL, N_("page"), GTK_WIDGET(g->notebook), &notebook_def);
 
-  // Main container: preview_box + notebook
+  // Main container: notebook only (WHERE is delegated to the darktable blend mask)
   GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, DT_BAUHAUS_SPACE);
-
-  // Preview -- ABOVE the notebook tabs so it stays visible on all pages
-  GtkWidget *preview_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_BAUHAUS_SPACE);
-  gtk_box_pack_start(GTK_BOX(preview_box), gtk_label_new(_("Preview:")), FALSE, FALSE, 0);
-
-  g->preview_mode_combo = gtk_combo_box_text_new();
-  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g->preview_mode_combo), _("Image"));
-  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g->preview_mode_combo), _("B&W Mask"));
-  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g->preview_mode_combo), _("Colour Mask"));
-  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g->preview_mode_combo), _("Checker (before)"));
-  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g->preview_mode_combo), _("Checker (after)"));
-  gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g->preview_mode_combo), _("Correction"));
-  g_signal_connect(G_OBJECT(g->preview_mode_combo), "changed",
-                   G_CALLBACK(_preview_mode_changed_cb), self);
-  gtk_box_pack_start(GTK_BOX(preview_box), g->preview_mode_combo, TRUE, TRUE, 0);
-  gtk_box_pack_start(GTK_BOX(vbox), preview_box, FALSE, FALSE, 0);
-
   gtk_box_pack_start(GTK_BOX(vbox), GTK_WIDGET(g->notebook), TRUE, TRUE, 0);
-
   self->widget = vbox;
 
   // =========================================================================
-  // TAB 1: SELECTION
+  // TAB 1: SOURCE + REACH
   // =========================================================================
   GtkWidget *page_sel = dt_ui_notebook_page(g->notebook,
-                                            N_("selection"),
-                                            _("source color selection"));
+                                            N_("source"),
+                                            _("source reference colour and correction reach"));
 
   dt_gui_box_add(page_sel, dt_ui_section_label_new(_("source color")));
-
   g->source_hue_picker = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
   gtk_widget_set_tooltip_text(g->source_hue_picker,
-    _("pick a source color: sets the correction anchor and\n"
-      "re-centers the hue / chroma / lightness selection ranges on it"));
+    _("pick the source reference colour (the affinity pivot).\n"
+      "WHERE the effect is applied is decided by this module's blend mask\n"
+      "(parametric hz/Cz/Jz + drawn/AI + feathering)."));
   dt_gui_box_add(page_sel, g->source_hue_picker);
 
-  dt_gui_box_add(page_sel, dt_ui_section_label_new(_("selection ranges")));
-
-  // HUE: symmetric circular arc (center + plateau/falloff half-widths).
-  // Temporary sliders -- a circular ring widget will replace them; the model
-  // already selects wrapping arcs (e.g. reds around 0 deg) correctly.
-  dt_gui_box_add(page_sel, dt_ui_label_new(_("hue (circular arc)")));
-  g->hue_center  = _create_manual_slider(self, _("hue center"), 0.0f, 1.0f, 0.001f, 0.08f, 1, "°", 360.0f);
-  _paint_hue_slider(g->hue_center);
-  dt_bauhaus_slider_set_feedback(g->hue_center, 0); // no left fill: keep the hue gradient readable
-  dt_gui_box_add(page_sel, g->hue_center);
-
-  // collapsible hue wheel: draggable ring + plateau/falloff fine controls
-  // NOTE: dt_gui_new_collapsible_section packs its expander with gtk_box_pack_end,
-  // so it would drop to the bottom of the page if given page_sel directly. Wrap it
-  // in a dedicated vbox (agx pattern) and place that vbox right after the hue line.
-  GtkWidget *ring_box = dt_gui_vbox();
-  dt_gui_new_collapsible_section(&g->hue_ring_section,
-                                 "plugins/darkroom/coloruniformityv2/expand_hue_ring",
-                                 _("hue wheel"), GTK_BOX(ring_box), DT_ACTION(self));
-  dt_gui_box_add(page_sel, ring_box);
-  g->hue_ring_area = dt_ui_resize_wrap(NULL, 200, "plugins/darkroom/coloruniformityv2/hue_ring_height");
-  gtk_widget_set_can_focus(g->hue_ring_area, TRUE);
-  gtk_widget_add_events(g->hue_ring_area,
-    GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
-  g_signal_connect(G_OBJECT(g->hue_ring_area), "draw", G_CALLBACK(_hue_ring_draw), self);
-  g_signal_connect(G_OBJECT(g->hue_ring_area), "button-press-event", G_CALLBACK(_hue_ring_press), self);
-  g_signal_connect(G_OBJECT(g->hue_ring_area), "motion-notify-event", G_CALLBACK(_hue_ring_motion), self);
-  g_signal_connect(G_OBJECT(g->hue_ring_area), "button-release-event", G_CALLBACK(_hue_ring_release), self);
-  gtk_widget_set_tooltip_text(g->hue_ring_area,
-    _("drag near the center marker to rotate, the inner marks set the plateau,\n"
-      "the outer marks set the falloff"));
-  dt_gui_box_add(g->hue_ring_section.container, g->hue_ring_area);
-
-  g->hue_plateau = _create_manual_slider(self, _("hue plateau"), 0.0f, 0.5f, 0.001f, 0.5f, 1, "°", 360.0f);
-  gtk_widget_set_tooltip_text(g->hue_plateau, _("half-width of the full-weight hue arc"));
-  dt_gui_box_add(g->hue_ring_section.container, g->hue_plateau);
-  g->hue_falloff = _create_manual_slider(self, _("hue falloff"), 0.0f, 0.5f, 0.001f, 0.0f, 1, "°", 360.0f);
-  gtk_widget_set_tooltip_text(g->hue_falloff, _("extra half-width of the hue transition to zero"));
-  dt_gui_box_add(g->hue_ring_section.container, g->hue_falloff);
-
-  // CHROMA: linear 4-handle range + gray->saturated gradient reference
-  dt_gui_box_add(page_sel, dt_ui_label_new(_("chroma")));
-  g->chroma_slider = _create_range_slider(self);
-  {
-    GtkDarktableGradientSlider *s = DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->chroma_slider);
-    GdkRGBA g0 = { 0.5, 0.5, 0.5, 1.0 }, g1 = { 0.9, 0.2, 0.2, 1.0 };
-    dtgtk_gradient_slider_multivalue_set_stop(s, 0.0, g0);
-    dtgtk_gradient_slider_multivalue_set_stop(s, 1.0, g1);
-  }
-  gtk_widget_set_tooltip_text(g->chroma_slider,
-    _("chroma (saturation) selection range.\n"
-      "the low handles also exclude neutral/gray pixels"));
-  dt_gui_box_add(page_sel, g->chroma_slider);
-
-  // LIGHTNESS: linear 4-handle range + black->white gradient reference
-  dt_gui_box_add(page_sel, dt_ui_label_new(_("lightness")));
-  g->light_slider = _create_range_slider(self);
-  {
-    GtkDarktableGradientSlider *s = DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->light_slider);
-    GdkRGBA b0 = { 0.0, 0.0, 0.0, 1.0 }, b1 = { 1.0, 1.0, 1.0, 1.0 };
-    dtgtk_gradient_slider_multivalue_set_stop(s, 0.0, b0);
-    dtgtk_gradient_slider_multivalue_set_stop(s, 1.0, b1);
-  }
-  gtk_widget_set_tooltip_text(g->light_slider,
-    _("lightness selection range (perceptual)"));
-  dt_gui_box_add(page_sel, g->light_slider);
+  dt_gui_box_add(page_sel, dt_ui_section_label_new(_("reach")));
+  g->reach_h = _create_manual_slider(self, _("hue reach"), 0.01f, 0.5f, 0.001f, 0.15f, 1, "°", 360.0f);
+  gtk_widget_set_tooltip_text(g->reach_h,
+    _("colour distance (in hue) around the source over which the correction acts,\n"
+      "with a soft falloff. beyond it, the correction fades to zero."));
+  dt_gui_box_add(page_sel, g->reach_h);
+  g->reach_c = _create_manual_slider(self, _("chroma reach"), 0.01f, 1.5f, 0.001f, 0.5f, 2, "", 1.0f);
+  gtk_widget_set_tooltip_text(g->reach_c, _("chroma distance around the source over which the correction acts"));
+  dt_gui_box_add(page_sel, g->reach_c);
+  g->reach_l = _create_manual_slider(self, _("lightness reach"), 0.1f, 6.0f, 0.01f, 2.0f, 1, " EV", 1.0f);
+  gtk_widget_set_tooltip_text(g->reach_l, _("lightness distance (EV) around the source over which the correction acts"));
+  dt_gui_box_add(page_sel, g->reach_l);
 
   // =========================================================================
   // TAB 2: CORRECTION
