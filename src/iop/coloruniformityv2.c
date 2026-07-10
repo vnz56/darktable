@@ -608,20 +608,6 @@ static void _paint_hue_priority_slider(GtkWidget *slider, const float target_hue
   gtk_widget_queue_draw(slider);
 }
 
-// ====================== AUTO BUTTONS ======================
-static void _shift_hue_cb(GtkWidget *widget, gpointer user_data)
-{
-  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
-  dt_iop_coloruniformityv2_params_t *p = (dt_iop_coloruniformityv2_params_t *)self->params;
-  dt_iop_coloruniformityv2_gui_data_t *g = (dt_iop_coloruniformityv2_gui_data_t *)self->gui_data;
-
-  p->offset_h = 0.0f;
-
-  ++darktable.gui->reset;
-  dt_bauhaus_slider_set(g->offset_h, p->offset_h);
-  --darktable.gui->reset;
-  dt_dev_add_history_item(self->dev, self, TRUE);
-}
 
 
 // --- GUI CALLBACKS ---
@@ -1007,15 +993,6 @@ void gui_init(dt_iop_module_t *self)
     dt_gui_box_add(page_cor, exp);
   }
 
-  GtkWidget *auto_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_BAUHAUS_SPACE);
-
-  GtkWidget *btn_auto_h = gtk_button_new_with_label(_("hue shift"));
-  g_signal_connect(G_OBJECT(btn_auto_h), "clicked", G_CALLBACK(_shift_hue_cb), self);
-  gtk_widget_set_tooltip_text(btn_auto_h, _("Full shift towards target hue, applied in adjustments tab"));
-  gtk_box_pack_start(GTK_BOX(auto_box), btn_auto_h, TRUE, TRUE, 0);
-  gtk_widget_show_all(auto_box);
-  dt_gui_box_add(page_cor, auto_box);
-  
   // =========================================================================
   // TAB 3: ADJUSTMENTS
   // =========================================================================
