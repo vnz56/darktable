@@ -39,20 +39,6 @@ V8 - Additions over V7:
 
 // clang-format off
 typedef struct dt_iop_coloruniformityv2_params_t {
-  // --- CORRECTION SOURCE ANCHOR ---
-  // Not just selection: the correction references these (negative strength
-  // pushes away from source, offset & affinity are relative to it).
-  float source_hue;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.12 $DESCRIPTION: "Source Hue"
-  float source_chroma;     // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 0.20 $DESCRIPTION: "Source Chroma"
-  float source_lightness;  // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 0.50 $DESCRIPTION: "Source Lightness"
-
-  // --- REACH ("portée"): color-distance from the source over which the correction
-  // acts (soft falloff to 0). Not a selection -- the darktable blend mask decides
-  // WHERE; reach shapes HOW the (global) correction fades by color around the source.
-  float reach_h;           // $MIN: 0.01 $MAX: 0.5 $DEFAULT: 0.15 $DESCRIPTION: "hue reach"
-  float reach_c;           // $MIN: 0.01 $MAX: 1.5 $DEFAULT: 0.5  $DESCRIPTION: "chroma reach"
-  float reach_l;           // $MIN: 0.1  $MAX: 6.0 $DEFAULT: 2.0  $DESCRIPTION: "lightness reach"
-
   // --- CORRECTION (Target T) ---
   float target_hue;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.12 $DESCRIPTION: "Target Hue"
   float target_chroma;     // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 0.20 $DESCRIPTION: "Target Chroma"
@@ -106,10 +92,6 @@ DT_MODULE_INTROSPECTION(1, dt_iop_coloruniformityv2_params_t)
 
 typedef struct dt_iop_coloruniformityv2_gui_data_t {
   // Selection (parametric ranges, darktable-style 4-handle sliders)
-  GtkWidget *source_hue_picker;   // standalone pipette: sets the source reference
-  GtkWidget *reach_h;
-  GtkWidget *reach_c;
-  GtkWidget *reach_l;
 
   // Correction
   GtkWidget *target_hue_picker;
@@ -200,27 +182,26 @@ static inline gboolean _rgb_invalid(const dt_aligned_pixel_t rgb) {
 // affinity > 0 -> peak (reinforces center)
 // affinity < 0 -> donut (hollows out center)
 // preserve: neutral zone radius for donut mode
-// Reach window: 1 at the source (t=0), smoothly to 0 at t>=1 (the reach edge).
-static inline float _reach_window(const float t)
+// Fixed per-channel scales normalizing the colour distance to the target for the
+// affinity donut (hue in turns, chroma in Yrg units, lightness in EV).
+#define CU2_SCALE_H 0.5f
+#define CU2_SCALE_C 1.0f
+#define CU2_SCALE_L 3.0f
+
+// Affinity donut around the TARGET (t_norm = normalized colour distance to target).
+// affinity >= 0: full correction everywhere (1).
+// affinity <  0: a preserved core of inner radius |affinity| (untouched), ramping
+//                back to full at the normalization edge. Lower affinity -> bigger
+//                untouched core. This is the module's key "natural retouch" control.
+static inline float _affinity_weight(const float affinity, const float t_norm)
 {
-  if(t >= 1.0f) return 0.0f;
-  const float s = 1.0f - t;
-  return s * s * (3.0f - 2.0f * s); // smoothstep
+  if(affinity >= 0.0f) return 1.0f;
+  const float rin = -affinity;              // inner radius (preserved core), [0,1]
+  if(t_norm <= rin) return 0.0f;            // inside the core: untouched
+  const float u = CLAMPF((t_norm - rin) / fmaxf(1.0f - rin, 1e-3f), 0.0f, 1.0f);
+  return u * u * (3.0f - 2.0f * u);         // smoothstep up to full correction
 }
 
-// t_norm: per-component normalized distance (0 = center, ~1 = edge)
-static inline float apply_affinity(const float base_weight, const float affinity,
-                                   const float preserve, const float t_norm)
-{
-  if(base_weight < 1e-6f) return 0.0f;
-  if(affinity >= 0.0f) {
-    return base_weight * (1.0f + affinity * base_weight);
-  } else {
-    const float safe_preserve = fmaxf(preserve, 1e-3f);
-    const float hole = expf(-t_norm / (safe_preserve * safe_preserve));
-    return base_weight * (1.0f - fabsf(affinity) * hole);
-  }
-}
 
 void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid, void *const ovoid,
@@ -284,31 +265,30 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
       // Yrg hue: angle in the r,g plane around D65 neutral, in [0,1] turns
       const float h_pix = wrap_hue(atan2f(dg_pix, dr_pix) / (2.0f * M_PI_F));
 
-      // --- B. REACH ("portée"): soft colour window around the source. This is the
-      // correction's colour extent (applied globally); the darktable blend mask
-      // decides WHERE in the image the effect is kept. Distances in native units.
-      const float t_norm_h = fabsf(hue_dist(h_pix, p->source_hue)) / fmaxf(p->reach_h, 1e-3f);
-      const float t_norm_c = fabsf(c_pix - p->source_chroma) / fmaxf(p->reach_c, 1e-3f);
-      const float t_norm_l = fabsf(log2f(fmaxf(Y_pix, 1e-6f)) - log2f(fmaxf(p->source_lightness, 1e-6f)))
-                           / fmaxf(p->reach_l, 1e-3f);
-      float weight = _reach_window(t_norm_h) * _reach_window(t_norm_c) * _reach_window(t_norm_l);
+      // --- B. AFFINITY (donut around the TARGET). Correction is global; the
+      // darktable blend mask decides WHERE it is kept. The affinity carves a
+      // preserved core around the target: only pixels that drifted away from it
+      // are corrected. Distance to target is normalized by a fixed per-channel
+      // scale (the outer colour extent is the mask's job, not an internal reach). ---
+      const float t_norm_h = fabsf(hue_dist(h_pix, p->target_hue)) / CU2_SCALE_H;
+      const float t_norm_c = fabsf(c_pix - p->target_chroma) / CU2_SCALE_C;
+      const float t_norm_l = fabsf(log2f(fmaxf(Y_pix, 1e-6f)) - log2f(fmaxf(p->target_lightness, 1e-6f)))
+                           / CU2_SCALE_L;
 
-      // Passthrough if outside the reach or nothing configured
-      if (weight < 1e-4f
-          || (p->strength_h == 0.f && p->strength_c == 0.f && p->strength_l == 0.f
-              && p->offset_h == 0.f && p->offset_c == 0.f && p->offset_l == 0.f)) {
+      // Passthrough if nothing configured
+      if (p->strength_h == 0.f && p->strength_c == 0.f && p->strength_l == 0.f
+          && p->offset_h == 0.f && p->offset_c == 0.f && p->offset_l == 0.f) {
         for(int c = 0; c < 4; c++) out_ptr[c] = in_ptr[c];
         continue;
       }
 
       // --- C. CORRECTIONS ---
 
-      const float off_w = p->offsets_weighted ? weight : 1.0f;
-      
-      // Per-component weights with independent affinity and per-component t_norm (P1)
-      const float w_h = apply_affinity(weight, p->affinity_h, p->preserve_h, t_norm_h);
-      const float w_c = apply_affinity(weight, p->affinity_c, p->preserve_c, t_norm_c);
-      const float w_l = apply_affinity(weight, p->affinity_l, p->preserve_l, t_norm_l);
+      const float off_w = 1.0f; // offsets are uniform
+      // Per-component affinity weight (preserved-core donut around the target)
+      const float w_h = _affinity_weight(p->affinity_h, t_norm_h);
+      const float w_c = _affinity_weight(p->affinity_c, t_norm_c);
+      const float w_l = _affinity_weight(p->affinity_l, t_norm_l);
 
       // ===============================================================
       // 1. Hue correction (UCS space)
@@ -330,14 +310,15 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
             delta_h = gap;
           h_side = hue_dist(h_pix, p->target_hue);
         } else {
-          delta_h = hue_dist(h_pix, p->source_hue) * w_h * fabsf(p->strength_h);
-          h_side = hue_dist(h_pix, p->source_hue);
+          // negative strength: push away from the target
+          delta_h = hue_dist(h_pix, p->target_hue) * w_h * fabsf(p->strength_h);
+          h_side = hue_dist(h_pix, p->target_hue);
         }
 
         // P2: Texture preservation (convergence only)
         if(p->preserve_texture_h > 0.0f && p->strength_h >= 0.0f)
         {
-          const float d_norm = fabsf(hue_dist(h_pix, p->target_hue)) / fmaxf(p->reach_h, 1e-3f);
+          const float d_norm = fabsf(hue_dist(h_pix, p->target_hue)) / CU2_SCALE_H;
           delta_h *= 1.0f - p->preserve_texture_h * expf(-d_norm * d_norm * 8.0f);
         }
 
@@ -388,13 +369,14 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
             delta_c = gap_c;
           c_side = (c_base > p->target_chroma) ? 1.0f : -1.0f;
         } else {
-          delta_c = (c_base - p->source_chroma) * w_c * fabsf(p->strength_c);
-          c_side = (c_base > p->source_chroma) ? 1.0f : -1.0f;
+          // negative strength: push away from the target
+          delta_c = (c_base - p->target_chroma) * w_c * fabsf(p->strength_c);
+          c_side = (c_base > p->target_chroma) ? 1.0f : -1.0f;
         }
 
         if(p->preserve_texture_c > 0.0f && p->strength_c >= 0.0f)
         {
-          const float ref_c = fmaxf(p->source_chroma, 1e-4f);
+          const float ref_c = fmaxf(p->target_chroma, 1e-4f);
           const float d_norm = fabsf(c_base - p->target_chroma) / ref_c;
           delta_c *= 1.0f - p->preserve_texture_c * expf(-d_norm * d_norm * 8.0f);
         }
@@ -420,7 +402,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         float l_side;
 
         const float log_target = log2f(fmaxf(p->target_lightness, 1e-6f));
-        const float log_source = log2f(fmaxf(p->source_lightness, 1e-6f));
 
         if (p->strength_l >= 0.f) {
           const float gap_l = log_target - log_Y;
@@ -430,14 +411,15 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
             delta_l = gap_l;
           l_side = (log_Y > log_target) ? 1.0f : -1.0f;
         } else {
-          delta_l = (log_Y - log_source) * w_l * fabsf(p->strength_l);
-          l_side = (log_Y > log_source) ? 1.0f : -1.0f;
+          // negative strength: push away from the target
+          delta_l = (log_Y - log_target) * w_l * fabsf(p->strength_l);
+          l_side = (log_Y > log_target) ? 1.0f : -1.0f;
         }
 
         // P2: Texture preservation
         if(p->preserve_texture_l > 0.0f && p->strength_l >= 0.0f)
         {
-          const float range = fmaxf(p->reach_l, 1e-3f);
+          const float range = CU2_SCALE_L;
           const float d_norm = fabsf(log_Y - log_target) / range;
           delta_l *= 1.0f - p->preserve_texture_l * expf(-d_norm * d_norm * 8.0f);
         }
@@ -611,7 +593,7 @@ static void _shift_hue_cb(GtkWidget *widget, gpointer user_data)
   dt_iop_coloruniformityv2_params_t *p = (dt_iop_coloruniformityv2_params_t *)self->params;
   dt_iop_coloruniformityv2_gui_data_t *g = (dt_iop_coloruniformityv2_gui_data_t *)self->gui_data;
 
-  p->offset_h = hue_dist(p->target_hue, p->source_hue);
+  p->offset_h = 0.0f;
 
   ++darktable.gui->reset;
   dt_bauhaus_slider_set(g->offset_h, p->offset_h);
@@ -655,11 +637,7 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
   const float h_picked = wrap_hue(atan2f(dg, dr) / (2.0f * M_PI_F));
 
   ++darktable.gui->reset;
-  if(picker == g->source_hue_picker) {
-    p->source_hue = h_picked;
-    p->source_chroma = c_picked;
-    p->source_lightness = Y_picked;
-  } else if(picker == g->target_hue_picker) {
+  if(picker == g->target_hue_picker) {
     p->target_hue = h_picked;
     p->target_chroma = c_picked;
     p->target_lightness = Y_picked;
@@ -681,12 +659,8 @@ static void _slider_changed_cb(GtkWidget *widget, gpointer user_data) {
   
   const float val = dt_bauhaus_slider_get(widget);
   
-  // Reach (correction colour extent)
-  if (widget == g->reach_h) p->reach_h = val;
-  else if (widget == g->reach_c) p->reach_c = val;
-  else if (widget == g->reach_l) p->reach_l = val;
   // Correction
-  else if (widget == g->target_hue_slider) {
+  if (widget == g->target_hue_slider) {
     p->target_hue = val;
     _paint_chroma_slider(g->target_chroma, val);
     _paint_hue_priority_slider(g->priority_h, val);
@@ -725,27 +699,6 @@ static void _offsets_weighted_changed_cb(GtkComboBox *widget, gpointer user_data
   dt_dev_add_history_item(self->dev, self, TRUE);
 }
 
-// Magic button: Copy Source -> Target
-static void _match_source_to_target_cb(GtkWidget *widget, gpointer user_data) {
-  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
-  dt_iop_coloruniformityv2_params_t *p = (dt_iop_coloruniformityv2_params_t *)self->params;
-  dt_iop_coloruniformityv2_gui_data_t *g = (dt_iop_coloruniformityv2_gui_data_t *)self->gui_data;
-
-  p->target_hue = p->source_hue;
-  p->target_chroma = p->source_chroma;
-  p->target_lightness = p->source_lightness;
-
-  ++darktable.gui->reset;
-  dt_bauhaus_slider_set(g->target_hue_slider, p->target_hue);
-  dt_bauhaus_slider_set(g->target_chroma, p->target_chroma);
-  dt_bauhaus_slider_set(g->target_lightness, p->target_lightness);
-  _paint_chroma_slider(g->target_chroma, p->target_hue);
-  _paint_hue_priority_slider(g->priority_h, p->target_hue);
-  --darktable.gui->reset;
-
-  dt_dev_add_history_item(self->dev, self, TRUE);
-}
-
 static void _bypass_hue_toggled(GtkWidget *widget, gpointer user_data)
 {
   dt_iop_module_t *self = (dt_iop_module_t *)user_data;
@@ -776,9 +729,6 @@ void gui_update(dt_iop_module_t *self) {
   ++darktable.gui->reset;
   
   // Reach (correction colour extent)
-  dt_bauhaus_slider_set(g->reach_h, p->reach_h);
-  dt_bauhaus_slider_set(g->reach_c, p->reach_c);
-  dt_bauhaus_slider_set(g->reach_l, p->reach_l);
   // Correction
   dt_bauhaus_slider_set(g->target_hue_slider, p->target_hue);
   dt_bauhaus_slider_set(g->target_chroma, p->target_chroma);
@@ -842,48 +792,14 @@ void gui_init(dt_iop_module_t *self)
   // =========================================================================
   // TAB 1: SOURCE + REACH
   // =========================================================================
-  GtkWidget *page_sel = dt_ui_notebook_page(g->notebook,
-                                            N_("source"),
-                                            _("source reference colour and correction reach"));
-
-  dt_gui_box_add(page_sel, dt_ui_section_label_new(_("source color")));
-  g->source_hue_picker = dt_color_picker_new(self, DT_COLOR_PICKER_AREA, NULL);
-  gtk_widget_set_tooltip_text(g->source_hue_picker,
-    _("pick the source reference colour (the affinity pivot).\n"
-      "WHERE the effect is applied is decided by this module's blend mask\n"
-      "(parametric hz/Cz/Jz + drawn/AI + feathering)."));
-  dt_gui_box_add(page_sel, g->source_hue_picker);
-
-  dt_gui_box_add(page_sel, dt_ui_section_label_new(_("reach")));
-  g->reach_h = _create_manual_slider(self, _("hue reach"), 0.01f, 0.5f, 0.001f, 0.15f, 1, "°", 360.0f);
-  gtk_widget_set_tooltip_text(g->reach_h,
-    _("colour distance (in hue) around the source over which the correction acts,\n"
-      "with a soft falloff. beyond it, the correction fades to zero."));
-  dt_gui_box_add(page_sel, g->reach_h);
-  g->reach_c = _create_manual_slider(self, _("chroma reach"), 0.01f, 1.5f, 0.001f, 0.5f, 2, "", 1.0f);
-  gtk_widget_set_tooltip_text(g->reach_c, _("chroma distance around the source over which the correction acts"));
-  dt_gui_box_add(page_sel, g->reach_c);
-  g->reach_l = _create_manual_slider(self, _("lightness reach"), 0.1f, 6.0f, 0.01f, 2.0f, 1, " EV", 1.0f);
-  gtk_widget_set_tooltip_text(g->reach_l, _("lightness distance (EV) around the source over which the correction acts"));
-  dt_gui_box_add(page_sel, g->reach_l);
-
   // =========================================================================
-  // TAB 2: CORRECTION
+  // TAB 1: CORRECTION (target + strength + affinity). WHERE = the blend mask.
   // =========================================================================
   GtkWidget *page_cor = dt_ui_notebook_page(g->notebook,
                                             N_("correction"),
                                             _("target color and convergence strength"));
 
-  GtkWidget *target_hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_BAUHAUS_SPACE);
-  gtk_box_pack_start(GTK_BOX(target_hdr),
-                     dt_ui_section_label_new(_("Target Color T")),
-                     TRUE, TRUE, 0);
-
-  GtkWidget *btn_match = gtk_button_new_with_label(_("S -> T"));
-  g_signal_connect(G_OBJECT(btn_match), "clicked",
-                   G_CALLBACK(_match_source_to_target_cb), self);
-  gtk_box_pack_end(GTK_BOX(target_hdr), btn_match, FALSE, FALSE, 0);
-  dt_gui_box_add(page_cor, target_hdr);
+  dt_gui_box_add(page_cor, dt_ui_section_label_new(_("target color")));
 
   g->target_hue_slider = _create_manual_slider(self, _("hue"),
                                                0.0f, 1.0f, 0.001f, 0.12f, 2, "°", 360.0f);
