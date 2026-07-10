@@ -1112,6 +1112,7 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(page_sel, dt_ui_label_new(_("hue (circular arc)")));
   g->hue_center  = _create_manual_slider(self, _("hue center"), 0.0f, 1.0f, 0.001f, 0.08f, 1, "°", 360.0f);
   _paint_hue_slider(g->hue_center);
+  dt_bauhaus_slider_set_feedback(g->hue_center, 0); // no left fill: keep the hue gradient readable
   dt_gui_box_add(page_sel, g->hue_center);
   g->hue_plateau = _create_manual_slider(self, _("hue plateau"), 0.0f, 0.5f, 0.001f, 0.5f, 1, "°", 360.0f);
   gtk_widget_set_tooltip_text(g->hue_plateau, _("half-width of the full-weight hue arc"));
