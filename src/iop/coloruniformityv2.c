@@ -129,10 +129,13 @@ DT_MODULE_INTROSPECTION(1, dt_iop_coloruniformityv2_params_t)
 typedef struct dt_iop_coloruniformityv2_gui_data_t {
   // Selection (parametric ranges, darktable-style 4-handle sliders)
   GtkWidget *source_hue_picker;   // standalone pipette: sets anchor + recenters ranges
-  // hue: symmetric circular arc (temp bauhaus sliders; circular ring widget to come)
+  // hue: symmetric circular arc -- colored center line + collapsible ring
   GtkWidget *hue_center;
   GtkWidget *hue_plateau;
   GtkWidget *hue_falloff;
+  dt_gui_collapsible_section_t hue_ring_section;
+  GtkWidget *hue_ring_area;
+  int ring_drag;   // 0 none, 1 center, 2 plateau edge, 3 falloff edge
   GtkWidget *chroma_slider;       // 4-handle gradient slider (chroma)
   GtkWidget *light_slider;        // 4-handle gradient slider (lightness)
 
@@ -837,6 +840,7 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
     // hue: center the arc on the picked hue (widths kept)
     p->hue_center = h_picked;
     dt_bauhaus_slider_set(g->hue_center, p->hue_center);
+    gtk_widget_queue_draw(g->hue_ring_area);
     // chroma / lightness: recenter the linear ranges on the picked color (widths kept)
     float ch[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
     _recenter_linear(ch, _chroma_axis(c_picked));
@@ -871,9 +875,9 @@ static void _slider_changed_cb(GtkWidget *widget, gpointer user_data) {
   const float val = dt_bauhaus_slider_get(widget);
   
   // Hue arc (chroma/lightness ranges are handled by _range_changed_cb)
-  if (widget == g->hue_center) p->hue_center = val;
-  else if (widget == g->hue_plateau) p->hue_plateau = val;
-  else if (widget == g->hue_falloff) p->hue_falloff = val;
+  if (widget == g->hue_center)  { p->hue_center = val;  gtk_widget_queue_draw(g->hue_ring_area); }
+  else if (widget == g->hue_plateau) { p->hue_plateau = val; gtk_widget_queue_draw(g->hue_ring_area); }
+  else if (widget == g->hue_falloff) { p->hue_falloff = val; gtk_widget_queue_draw(g->hue_ring_area); }
   // Correction
   else if (widget == g->target_hue_slider) {
     p->target_hue = val;
@@ -971,10 +975,11 @@ void gui_update(dt_iop_module_t *self) {
   dt_iop_coloruniformityv2_params_t *p = self->params;
   ++darktable.gui->reset;
   
-  // Hue arc (temp sliders)
+  // Hue arc (center line + ring)
   dt_bauhaus_slider_set(g->hue_center, p->hue_center);
   dt_bauhaus_slider_set(g->hue_plateau, p->hue_plateau);
   dt_bauhaus_slider_set(g->hue_falloff, p->hue_falloff);
+  if(g->hue_ring_area) gtk_widget_queue_draw(g->hue_ring_area);
   // Chroma / lightness ranges (4-handle gradient sliders)
   double dc[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
   double dl[4] = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
@@ -1058,6 +1063,137 @@ static GtkWidget *_create_range_slider(dt_iop_module_t *self)
   return w;
 }
 
+// ============================ HUE RING WIDGET ============================
+// Symmetric circular arc: center + plateau half-width + falloff half-width.
+// hue in [0,1] turns -> screen angle a = hue*2pi ; point = (cx+r cos a, cy+r sin a).
+
+static inline void _ring_geom(GtkWidget *w, double *cx, double *cy, double *rout, double *rin)
+{
+  GtkAllocation a; gtk_widget_get_allocation(w, &a);
+  *cx = a.width * 0.5; *cy = a.height * 0.5;
+  *rout = fmin(a.width, a.height) * 0.5 - 6.0;
+  *rin = *rout * 0.66;
+}
+
+static gboolean _hue_ring_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
+{
+  dt_iop_module_t *self = user_data;
+  dt_iop_coloruniformityv2_params_t *p = self->params;
+  double cx, cy, rout, rin;
+  _ring_geom(widget, &cx, &cy, &rout, &rin);
+  const double rmid = 0.5 * (rout + rin);
+
+  // 1. hue ring (thick coloured segments)
+  const int N = 240;
+  cairo_set_line_width(cr, rout - rin);
+  for(int i = 0; i < N; i++)
+  {
+    const double h0 = (double)i / N, h1 = (double)(i + 1) / N;
+    float r, g, b; _hue_to_rgb((float)(0.5 * (h0 + h1)), &r, &g, &b);
+    cairo_set_source_rgb(cr, r, g, b);
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, cx, cy, rmid, h0 * 2.0 * M_PI, h1 * 2.0 * M_PI);
+    cairo_stroke(cr);
+  }
+
+  // 2. selected arc overlay: plateau (opaque white edge) + falloff (fading)
+  const double ap = p->hue_center * 2.0 * M_PI;
+  const double plat = p->hue_plateau * 2.0 * M_PI;
+  const double fall = p->hue_falloff * 2.0 * M_PI;
+  // dim the unselected part with a translucent veil, then leave selected bright
+  cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.55);
+  cairo_set_line_width(cr, rout - rin + 2.0);
+  cairo_new_sub_path(cr);
+  cairo_arc(cr, cx, cy, rmid, ap + plat + fall, ap - plat - fall + 2.0 * M_PI);
+  cairo_stroke(cr);
+
+  // 3. handles: center tick + plateau/falloff markers (both sides)
+  cairo_set_line_width(cr, 2.0);
+  for(int s = -1; s <= 1; s += 2)
+  {
+    // plateau edge
+    const double aP = ap + s * plat;
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_new_sub_path(cr); cairo_arc(cr, cx + rmid * cos(aP), cy + rmid * sin(aP), 4.0, 0, 2 * M_PI); cairo_fill(cr);
+    // falloff edge
+    const double aF = ap + s * (plat + fall);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.6);
+    cairo_new_sub_path(cr); cairo_arc(cr, cx + rmid * cos(aF), cy + rmid * sin(aF), 3.0, 0, 2 * M_PI); cairo_stroke(cr);
+  }
+  // center marker (radial line)
+  cairo_set_source_rgb(cr, 1, 1, 1);
+  cairo_set_line_width(cr, 2.0);
+  cairo_move_to(cr, cx + (rin - 2) * cos(ap), cy + (rin - 2) * sin(ap));
+  cairo_line_to(cr, cx + (rout + 2) * cos(ap), cy + (rout + 2) * sin(ap));
+  cairo_stroke(cr);
+  return FALSE;
+}
+
+// map mouse to hue + whether within the ring band
+static gboolean _ring_hue_at(GtkWidget *w, double mx, double my, float *hue)
+{
+  double cx, cy, rout, rin; _ring_geom(w, &cx, &cy, &rout, &rin);
+  const double dx = mx - cx, dy = my - cy, r = hypot(dx, dy);
+  *hue = wrap_hue((float)(atan2(dy, dx) / (2.0 * M_PI)));
+  return (r > rin - 12.0 && r < rout + 12.0);
+}
+
+static void _ring_sync(dt_iop_module_t *self)
+{
+  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
+  dt_iop_coloruniformityv2_params_t *p = self->params;
+  ++darktable.gui->reset;
+  dt_bauhaus_slider_set(g->hue_center, p->hue_center);
+  dt_bauhaus_slider_set(g->hue_plateau, p->hue_plateau);
+  dt_bauhaus_slider_set(g->hue_falloff, p->hue_falloff);
+  --darktable.gui->reset;
+  gtk_widget_queue_draw(g->hue_ring_area);
+}
+
+static gboolean _hue_ring_press(GtkWidget *widget, GdkEventButton *ev, gpointer user_data)
+{
+  dt_iop_module_t *self = user_data;
+  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
+  dt_iop_coloruniformityv2_params_t *p = self->params;
+  float h; if(!_ring_hue_at(widget, ev->x, ev->y, &h)) return FALSE;
+  const float d = fabsf(hue_dist(h, p->hue_center));
+  const float e_p = p->hue_plateau, e_f = p->hue_plateau + p->hue_falloff;
+  if(d < fmaxf(e_p * 0.5f, 0.02f)) g->ring_drag = 1;              // center
+  else if(fabsf(d - e_p) <= fabsf(d - e_f)) g->ring_drag = 2;     // plateau edge
+  else g->ring_drag = 3;                                          // falloff edge
+  // apply immediately
+  if(g->ring_drag == 1) p->hue_center = h;
+  else if(g->ring_drag == 2) p->hue_plateau = CLAMPF(d, 0.0f, 0.5f - p->hue_falloff);
+  else p->hue_falloff = CLAMPF(d - p->hue_plateau, 0.0f, 0.5f - p->hue_plateau);
+  _ring_sync(self);
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+  return TRUE;
+}
+
+static gboolean _hue_ring_motion(GtkWidget *widget, GdkEventMotion *ev, gpointer user_data)
+{
+  dt_iop_module_t *self = user_data;
+  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
+  dt_iop_coloruniformityv2_params_t *p = self->params;
+  if(!g->ring_drag) return FALSE;
+  float h; _ring_hue_at(widget, ev->x, ev->y, &h);
+  const float d = fabsf(hue_dist(h, p->hue_center));
+  if(g->ring_drag == 1) p->hue_center = h;
+  else if(g->ring_drag == 2) p->hue_plateau = CLAMPF(d, 0.0f, 0.5f - p->hue_falloff);
+  else p->hue_falloff = CLAMPF(d - p->hue_plateau, 0.0f, 0.5f - p->hue_plateau);
+  _ring_sync(self);
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+  return TRUE;
+}
+
+static gboolean _hue_ring_release(GtkWidget *widget, GdkEventButton *ev, gpointer user_data)
+{
+  dt_iop_module_t *self = user_data;
+  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
+  g->ring_drag = 0;
+  return TRUE;
+}
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_coloruniformityv2_gui_data_t *g = IOP_GUI_ALLOC(coloruniformityv2);
@@ -1114,12 +1250,30 @@ void gui_init(dt_iop_module_t *self)
   _paint_hue_slider(g->hue_center);
   dt_bauhaus_slider_set_feedback(g->hue_center, 0); // no left fill: keep the hue gradient readable
   dt_gui_box_add(page_sel, g->hue_center);
+
+  // collapsible hue wheel: draggable ring + plateau/falloff fine controls
+  dt_gui_new_collapsible_section(&g->hue_ring_section,
+                                 "plugins/darkroom/coloruniformityv2/expand_hue_ring",
+                                 _("hue wheel"), GTK_BOX(page_sel), DT_ACTION(self));
+  g->hue_ring_area = dt_ui_resize_wrap(NULL, 200, "plugins/darkroom/coloruniformityv2/hue_ring_height");
+  gtk_widget_set_can_focus(g->hue_ring_area, TRUE);
+  gtk_widget_add_events(g->hue_ring_area,
+    GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+  g_signal_connect(G_OBJECT(g->hue_ring_area), "draw", G_CALLBACK(_hue_ring_draw), self);
+  g_signal_connect(G_OBJECT(g->hue_ring_area), "button-press-event", G_CALLBACK(_hue_ring_press), self);
+  g_signal_connect(G_OBJECT(g->hue_ring_area), "motion-notify-event", G_CALLBACK(_hue_ring_motion), self);
+  g_signal_connect(G_OBJECT(g->hue_ring_area), "button-release-event", G_CALLBACK(_hue_ring_release), self);
+  gtk_widget_set_tooltip_text(g->hue_ring_area,
+    _("drag near the center marker to rotate, the inner marks set the plateau,\n"
+      "the outer marks set the falloff"));
+  dt_gui_box_add(g->hue_ring_section.container, g->hue_ring_area);
+
   g->hue_plateau = _create_manual_slider(self, _("hue plateau"), 0.0f, 0.5f, 0.001f, 0.5f, 1, "°", 360.0f);
   gtk_widget_set_tooltip_text(g->hue_plateau, _("half-width of the full-weight hue arc"));
-  dt_gui_box_add(page_sel, g->hue_plateau);
+  dt_gui_box_add(g->hue_ring_section.container, g->hue_plateau);
   g->hue_falloff = _create_manual_slider(self, _("hue falloff"), 0.0f, 0.5f, 0.001f, 0.0f, 1, "°", 360.0f);
   gtk_widget_set_tooltip_text(g->hue_falloff, _("extra half-width of the hue transition to zero"));
-  dt_gui_box_add(page_sel, g->hue_falloff);
+  dt_gui_box_add(g->hue_ring_section.container, g->hue_falloff);
 
   // CHROMA: linear 4-handle range + gray->saturated gradient reference
   dt_gui_box_add(page_sel, dt_ui_label_new(_("chroma")));
