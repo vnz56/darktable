@@ -188,18 +188,21 @@ static inline gboolean _rgb_invalid(const dt_aligned_pixel_t rgb) {
 #define CU2_SCALE_C 1.0f
 #define CU2_SCALE_L 3.0f
 
-// Affinity donut around the TARGET (t_norm = normalized colour distance to target).
-// affinity >= 0: full correction everywhere (1).
-// affinity <  0: a preserved core of inner radius |affinity| (untouched), ramping
-//                back to full at the normalization edge. Lower affinity -> bigger
-//                untouched core. This is the module's key "natural retouch" control.
-static inline float _affinity_weight(const float affinity, const float t_norm)
+// Affinity donut around the TARGET. Two independent controls:
+//   affinity  (-1..1): POWER/DEPTH. positive = boost the correction; negative =
+//                      preserve the core, |affinity| being how completely (1 = the
+//                      core is fully untouched, 0.5 = half).
+//   neutral   (0..1) : RADIUS of the preserved core (donut inner radius): how far
+//                      from the target the preservation extends. hole = exp(-t/n²).
+// t_norm = normalized colour distance to the target. base = 1 (correction is global,
+// the outer extent is the darktable mask).
+static inline float _affinity_weight(const float affinity, const float neutral, const float t_norm)
 {
-  if(affinity >= 0.0f) return 1.0f;
-  const float rin = -affinity;              // inner radius (preserved core), [0,1]
-  if(t_norm <= rin) return 0.0f;            // inside the core: untouched
-  const float u = CLAMPF((t_norm - rin) / fmaxf(1.0f - rin, 1e-3f), 0.0f, 1.0f);
-  return u * u * (3.0f - 2.0f * u);         // smoothstep up to full correction
+  if(affinity >= 0.0f)
+    return 1.0f + affinity;                                // boost (clamped later by anti-overshoot)
+  const float safe_n = fmaxf(neutral, 1e-3f);
+  const float hole = expf(-t_norm / (safe_n * safe_n));    // 1 at target, fades with distance
+  return 1.0f - fabsf(affinity) * hole;                    // remove correction in the core
 }
 
 
@@ -285,10 +288,10 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
       // --- C. CORRECTIONS ---
 
       const float off_w = 1.0f; // offsets are uniform
-      // Per-component affinity weight (preserved-core donut around the target)
-      const float w_h = _affinity_weight(p->affinity_h, t_norm_h);
-      const float w_c = _affinity_weight(p->affinity_c, t_norm_c);
-      const float w_l = _affinity_weight(p->affinity_l, t_norm_l);
+      // Per-component affinity weight: affinity = depth/power, neutral zone = core radius
+      const float w_h = _affinity_weight(p->affinity_h, p->preserve_h, t_norm_h);
+      const float w_c = _affinity_weight(p->affinity_c, p->preserve_c, t_norm_c);
+      const float w_l = _affinity_weight(p->affinity_l, p->preserve_l, t_norm_l);
 
       // ===============================================================
       // 1. Hue correction (UCS space)
@@ -862,7 +865,12 @@ void gui_init(dt_iop_module_t *self)
 
     g->affinity_h = _create_manual_slider(self, _("affinity"),
                                           -1.0f, 1.0f, 0.01f, 0.0f, 2, NULL, 1.0f);
-    gtk_widget_set_tooltip_text(g->affinity_h, _("negative: donut (corrects flaws)\npositive: peak (smooths complexion)"));
+    gtk_widget_set_tooltip_text(g->affinity_h,
+      _("power of the affinity donut (its depth):\n"
+        "negative = preserve pixels near the target, only correct the drift\n"
+        "  (more negative = core more completely preserved)\n"
+        "positive = boost the correction\n"
+        "the radius of the preserved core is set by 'neutral zone' below."));
     gtk_box_pack_start(GTK_BOX(box), g->affinity_h, FALSE, FALSE, 0);
 
     g->preserve_h = _create_manual_slider(self, _("neutral zone"),
