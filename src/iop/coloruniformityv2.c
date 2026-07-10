@@ -1252,9 +1252,14 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(page_sel, g->hue_center);
 
   // collapsible hue wheel: draggable ring + plateau/falloff fine controls
+  // NOTE: dt_gui_new_collapsible_section packs its expander with gtk_box_pack_end,
+  // so it would drop to the bottom of the page if given page_sel directly. Wrap it
+  // in a dedicated vbox (agx pattern) and place that vbox right after the hue line.
+  GtkWidget *ring_box = dt_gui_vbox();
   dt_gui_new_collapsible_section(&g->hue_ring_section,
                                  "plugins/darkroom/coloruniformityv2/expand_hue_ring",
-                                 _("hue wheel"), GTK_BOX(page_sel), DT_ACTION(self));
+                                 _("hue wheel"), GTK_BOX(ring_box), DT_ACTION(self));
+  dt_gui_box_add(page_sel, ring_box);
   g->hue_ring_area = dt_ui_resize_wrap(NULL, 200, "plugins/darkroom/coloruniformityv2/hue_ring_height");
   gtk_widget_set_can_focus(g->hue_ring_area, TRUE);
   gtk_widget_add_events(g->hue_ring_area,
