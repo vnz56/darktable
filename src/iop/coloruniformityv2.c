@@ -235,13 +235,21 @@ static inline float _light_axis(const float Y)
 
 // Linear trapezoid factor from 4 handles [p0 edge_lo, p1 in_lo, p2 in_hi, p3 edge_hi].
 // (Same shape as darktable's _blendif_compute_factor.)
-static inline float _param_factor(const float v, const float p0, const float p1,
+static inline float _param_factor(float v, const float p0, const float p1,
                                   const float p2, const float p3)
 {
-  if(v <= p0 || v >= p3) return 0.0f;
-  if(v < p1) return (v - p0) / fmaxf(p1 - p0, 1e-6f);
-  if(v <= p2) return 1.0f;
-  return 1.0f - (v - p2) / fmaxf(p3 - p2, 1e-6f);
+  v = CLAMPF(v, 0.0f, 1.0f);
+  float f = 1.0f;
+  // low side: only cuts if the low handles are above 0 (handle at 0 => no low cut,
+  // so clamped extremes and full-range selections pass through)
+  if(v < p1) f = (v <= p0) ? 0.0f : (v - p0) / fmaxf(p1 - p0, 1e-6f);
+  // high side: only cuts if the high handles are below 1 (handle at 1 => no high cut)
+  if(v > p2)
+  {
+    const float hf = (v >= p3) ? 0.0f : 1.0f - (v - p2) / fmaxf(p3 - p2, 1e-6f);
+    f = fminf(f, hf);
+  }
+  return f;
 }
 
 // Hue: symmetric circular arc. 1 within the plateau half-width of the center,
