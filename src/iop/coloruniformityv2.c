@@ -210,8 +210,18 @@ static inline float _affinity_weight(const float affinity, const float neutral,
 {
   if(affinity >= 0.0f)
     return 1.0f + affinity;                                // boost (clamped later by anti-overshoot)
-  const float r = fmaxf(_neutral_radius(neutral, rmax), 1e-4f);
-  const float hole = expf(-(dist * dist) / (r * r));       // Gaussian core: e^-1 at dist = r
+  const float r = _neutral_radius(neutral, rmax);
+  // Flat, fully-preserved core up to r (so neutral at max = no effect within scope),
+  // then a smooth ramp back to full correction over a soft edge.
+  float hole;
+  if(dist <= r)
+    hole = 1.0f;
+  else
+  {
+    const float edge = fmaxf(r * 0.5f, 1e-4f);            // edge width scales with the core
+    const float u = CLAMPF((dist - r) / edge, 0.0f, 1.0f);
+    hole = 1.0f - u * u * (3.0f - 2.0f * u);              // smoothstep down
+  }
   return 1.0f - fabsf(affinity) * hole;                    // remove correction in the core
 }
 
