@@ -180,28 +180,38 @@ static inline gboolean _rgb_invalid(const dt_aligned_pixel_t rgb) {
 // Apply affinity (peak or donut) to a base weight, per component.
 // base_weight: raw selection (pizza slice * luma)
 // affinity > 0 -> peak (reinforces center)
-// affinity < 0 -> donut (hollows out center)
-// preserve: neutral zone radius for donut mode
-// Fixed per-channel scales normalizing the colour distance to the target for the
-// affinity donut (hue in turns, chroma in Yrg units, lightness in EV).
-#define CU2_SCALE_H 0.5f
-#define CU2_SCALE_C 1.0f
-#define CU2_SCALE_L 3.0f
+// Full colour scope per channel (native units): the maximum meaningful distance to
+// the target. The neutral-zone slider spans [0, R_max] progressively (see below).
+#define CU2_RMAX_H 0.5f    // hue: 0.5 turns = 180 deg (opposite hue)
+#define CU2_RMAX_C 1.0f    // chroma: covers the full realistic Yrg range
+#define CU2_RMAX_L 8.0f    // lightness: up to ~8 EV
+#define CU2_NEUTRAL_K 3.0f // exponential compression of the neutral slider
+
+// neutral [0,1] -> preserved-core characteristic radius (native units). Progressive:
+// fine resolution at the low end (small cores, where retouching lives), compressed at
+// the top (large cores), spanning the whole colour scope [0, R_max]. r' small near 0,
+// large near 1 (convex exponential).
+static inline float _neutral_radius(const float neutral, const float rmax)
+{
+  const float n = CLAMPF(neutral, 0.0f, 1.0f);
+  return rmax * (expf(CU2_NEUTRAL_K * n) - 1.0f) / (expf(CU2_NEUTRAL_K) - 1.0f);
+}
 
 // Affinity donut around the TARGET. Two independent controls:
 //   affinity  (-1..1): POWER/DEPTH. positive = boost the correction; negative =
 //                      preserve the core, |affinity| being how completely (1 = the
 //                      core is fully untouched, 0.5 = half).
-//   neutral   (0..1) : RADIUS of the preserved core (donut inner radius): how far
-//                      from the target the preservation extends. hole = exp(-t/n²).
-// t_norm = normalized colour distance to the target. base = 1 (correction is global,
+//   neutral   (0..1) : RADIUS of the preserved core, mapped progressively to native
+//                      colour distance via _neutral_radius.
+// dist = colour distance to the target (native units); base = 1 (correction is global,
 // the outer extent is the darktable mask).
-static inline float _affinity_weight(const float affinity, const float neutral, const float t_norm)
+static inline float _affinity_weight(const float affinity, const float neutral,
+                                     const float dist, const float rmax)
 {
   if(affinity >= 0.0f)
     return 1.0f + affinity;                                // boost (clamped later by anti-overshoot)
-  const float safe_n = fmaxf(neutral, 1e-3f);
-  const float hole = expf(-t_norm / (safe_n * safe_n));    // 1 at target, fades with distance
+  const float r = fmaxf(_neutral_radius(neutral, rmax), 1e-4f);
+  const float hole = expf(-(dist * dist) / (r * r));       // Gaussian core: e^-1 at dist = r
   return 1.0f - fabsf(affinity) * hole;                    // remove correction in the core
 }
 
@@ -271,12 +281,11 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
       // --- B. AFFINITY (donut around the TARGET). Correction is global; the
       // darktable blend mask decides WHERE it is kept. The affinity carves a
       // preserved core around the target: only pixels that drifted away from it
-      // are corrected. Distance to target is normalized by a fixed per-channel
-      // scale (the outer colour extent is the mask's job, not an internal reach). ---
-      const float t_norm_h = fabsf(hue_dist(h_pix, p->target_hue)) / CU2_SCALE_H;
-      const float t_norm_c = fabsf(c_pix - p->target_chroma) / CU2_SCALE_C;
-      const float t_norm_l = fabsf(log2f(fmaxf(Y_pix, 1e-6f)) - log2f(fmaxf(p->target_lightness, 1e-6f)))
-                           / CU2_SCALE_L;
+      // are corrected. Colour distances to target in native units (the neutral
+      // slider maps them to a core radius; the outer extent is the mask's job). ---
+      const float dist_h = fabsf(hue_dist(h_pix, p->target_hue));  // hue turns
+      const float dist_c = fabsf(c_pix - p->target_chroma);        // Yrg chroma
+      const float dist_l = fabsf(log2f(fmaxf(Y_pix, 1e-6f)) - log2f(fmaxf(p->target_lightness, 1e-6f))); // EV
 
       // Passthrough if nothing configured
       if (p->strength_h == 0.f && p->strength_c == 0.f && p->strength_l == 0.f
@@ -289,9 +298,9 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
       const float off_w = 1.0f; // offsets are uniform
       // Per-component affinity weight: affinity = depth/power, neutral zone = core radius
-      const float w_h = _affinity_weight(p->affinity_h, p->preserve_h, t_norm_h);
-      const float w_c = _affinity_weight(p->affinity_c, p->preserve_c, t_norm_c);
-      const float w_l = _affinity_weight(p->affinity_l, p->preserve_l, t_norm_l);
+      const float w_h = _affinity_weight(p->affinity_h, p->preserve_h, dist_h, CU2_RMAX_H);
+      const float w_c = _affinity_weight(p->affinity_c, p->preserve_c, dist_c, CU2_RMAX_C);
+      const float w_l = _affinity_weight(p->affinity_l, p->preserve_l, dist_l, CU2_RMAX_L);
 
       // ===============================================================
       // 1. Hue correction (UCS space)
@@ -321,7 +330,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         // P2: Texture preservation (convergence only)
         if(p->preserve_texture_h > 0.0f && p->strength_h >= 0.0f)
         {
-          const float d_norm = fabsf(hue_dist(h_pix, p->target_hue)) / CU2_SCALE_H;
+          const float d_norm = fabsf(hue_dist(h_pix, p->target_hue)) / CU2_RMAX_H;
           delta_h *= 1.0f - p->preserve_texture_h * expf(-d_norm * d_norm * 8.0f);
         }
 
@@ -422,7 +431,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         // P2: Texture preservation
         if(p->preserve_texture_l > 0.0f && p->strength_l >= 0.0f)
         {
-          const float range = CU2_SCALE_L;
+          const float range = CU2_RMAX_L;
           const float d_norm = fabsf(log_Y - log_target) / range;
           delta_l *= 1.0f - p->preserve_texture_l * expf(-d_norm * d_norm * 8.0f);
         }
