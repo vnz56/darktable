@@ -58,11 +58,11 @@ typedef struct dt_iop_coloruniformityv2_params_t {
   // --- SELECTION: parametric ranges, 4 handles [edge_lo, in_lo, in_hi, edge_hi] ---
   // Each on the channel's normalized [0,1] axis (see process() for axis mappings).
   // Trapezoid factor a la darktable parametric mask (_blendif_compute_factor).
-  // HUE axis (circular, [0,1] turns) -- default: full circle (select all hues)
-  float hue_h0;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0  $DESCRIPTION: "hue edge low"
-  float hue_h1;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0  $DESCRIPTION: "hue low"
-  float hue_h2;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0  $DESCRIPTION: "hue high"
-  float hue_h3;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0  $DESCRIPTION: "hue edge high"
+  // HUE: circular, symmetric arc = center + plateau half-width + falloff half-width.
+  // (Handles wrapping natively; default = whole circle.)
+  float hue_center;        // $MIN: 0.0 $MAX: 1.0  $DEFAULT: 0.08 $DESCRIPTION: "hue center"
+  float hue_plateau;       // $MIN: 0.0 $MAX: 0.5  $DEFAULT: 0.5  $DESCRIPTION: "hue plateau half-width"
+  float hue_falloff;       // $MIN: 0.0 $MAX: 0.5  $DEFAULT: 0.0  $DESCRIPTION: "hue falloff half-width"
   // CHROMA axis (c_pix / C_MAX) -- default: exclude near-neutral, no upper limit
   float chroma_h0;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.02 $DESCRIPTION: "chroma edge low"
   float chroma_h1;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.05 $DESCRIPTION: "chroma low"
@@ -129,7 +129,10 @@ DT_MODULE_INTROSPECTION(1, dt_iop_coloruniformityv2_params_t)
 typedef struct dt_iop_coloruniformityv2_gui_data_t {
   // Selection (parametric ranges, darktable-style 4-handle sliders)
   GtkWidget *source_hue_picker;   // standalone pipette: sets anchor + recenters ranges
-  GtkWidget *hue_slider;          // 4-handle gradient slider (circular hue)
+  // hue: symmetric circular arc (temp bauhaus sliders; circular ring widget to come)
+  GtkWidget *hue_center;
+  GtkWidget *hue_plateau;
+  GtkWidget *hue_falloff;
   GtkWidget *chroma_slider;       // 4-handle gradient slider (chroma)
   GtkWidget *light_slider;        // 4-handle gradient slider (lightness)
 
@@ -241,26 +244,24 @@ static inline float _param_factor(const float v, const float p0, const float p1,
   return 1.0f - (v - p2) / fmaxf(p3 - p2, 1e-6f);
 }
 
-// Circular version for hue: unwrap handles/value relative to the low edge so a
-// selection that wraps across 0/1 (e.g. reds) is handled correctly.
-static inline float _param_factor_hue(const float v, const float h0, const float h1,
-                                      const float h2, const float h3)
+// Hue: symmetric circular arc. 1 within the plateau half-width of the center,
+// linear ramp to 0 over the falloff half-width, 0 beyond. Wraps natively.
+static inline float _hue_arc_factor(const float h, const float center,
+                                    const float plateau, const float falloff)
 {
-  // full-circle selection -> everything passes
-  if(h0 <= 0.0f && h1 <= 0.0f && h2 >= 1.0f && h3 >= 1.0f) return 1.0f;
-  const float p1 = wrap_hue(h1 - h0);
-  const float p2 = wrap_hue(h2 - h0);
-  const float p3 = wrap_hue(h3 - h0);
-  const float x  = wrap_hue(v  - h0);
-  return _param_factor(x, 0.0f, p1, p2, p3);
+  const float d = fabsf(hue_dist(h, center)); // circular distance in [0, 0.5]
+  if(d <= plateau) return 1.0f;
+  if(d >= plateau + falloff) return 0.0f;
+  return 1.0f - (d - plateau) / fmaxf(falloff, 1e-6f);
 }
 
-// Full selection weight = product of the three per-channel trapezoid factors.
+// Full selection weight = hue arc factor x chroma trapezoid x lightness trapezoid.
 static inline float compute_selection_weight(
     const float h_pix, const float chroma_axis, const float light_axis,
-    const float *const hue_h, const float *const chroma_h, const float *const light_h)
+    const float hue_center, const float hue_plateau, const float hue_falloff,
+    const float *const chroma_h, const float *const light_h)
 {
-  const float fh = _param_factor_hue(h_pix, hue_h[0], hue_h[1], hue_h[2], hue_h[3]);
+  const float fh = _hue_arc_factor(h_pix, hue_center, hue_plateau, hue_falloff);
   if(fh <= 0.0f) return 0.0f;
   const float fc = _param_factor(chroma_axis, chroma_h[0], chroma_h[1], chroma_h[2], chroma_h[3]);
   if(fc <= 0.0f) return 0.0f;
@@ -358,15 +359,15 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
       // Neutral protection is now implicit in the chroma channel's low handles.
       const float chroma_axis = _chroma_axis(c_pix);
       const float light_axis  = _light_axis(Y_pix);
-      const float hue_h[4]    = { p->hue_h0, p->hue_h1, p->hue_h2, p->hue_h3 };
       const float chroma_h[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
       const float light_h[4]  = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
       float weight = compute_selection_weight(h_pix, chroma_axis, light_axis,
-                                              hue_h, chroma_h, light_h);
+                                              p->hue_center, p->hue_plateau, p->hue_falloff,
+                                              chroma_h, light_h);
 
       // --- Per-component normalized distance for affinity (relative to the source anchor,
-      // normalized by the selection range half-width on each channel's [0,1] axis) ---
-      const float hw_h = fmaxf((hue_h[3] - hue_h[0]) * 0.5f, 1e-3f);
+      // normalized by the selection range half-width on each channel's axis) ---
+      const float hw_h = fmaxf(p->hue_plateau + p->hue_falloff, 1e-3f);
       const float t_norm_h = fabsf(hue_dist(h_pix, p->source_hue)) / hw_h;
       const float hw_c = fmaxf((chroma_h[3] - chroma_h[0]) * 0.5f, 1e-3f);
       const float t_norm_c = fabsf(chroma_axis - _chroma_axis(p->source_chroma)) / hw_c;
@@ -788,16 +789,6 @@ static inline void _recenter_linear(float *h, const float target)
   d = CLAMPF(d, -h[0], 1.0f - h[3]);
   for(int i = 0; i < 4; i++) h[i] = CLAMPF(h[i] + d, 0.0f, 1.0f);
 }
-// Circular (hue) recenter, keeping widths.
-static inline void _recenter_hue(float *h, const float target)
-{
-  // full circle -> nothing to recenter
-  if(h[0] <= 0.0f && h[1] <= 0.0f && h[2] >= 1.0f && h[3] >= 1.0f) return;
-  const float center = wrap_hue(h[1] + wrap_hue(h[2] - h[1]) * 0.5f);
-  const float d = hue_dist(target, center); // signed shortest
-  for(int i = 0; i < 4; i++) h[i] = wrap_hue(h[i] + d);
-}
-
 void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpipe_t *pipe)
 {
   dt_iop_coloruniformityv2_params_t *p = (dt_iop_coloruniformityv2_params_t *)self->params;
@@ -835,20 +826,18 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
     p->source_hue = h_picked;
     p->source_chroma = c_picked;
     p->source_lightness = Y_picked;
-    // recenter the three selection ranges on the picked color (widths kept)
-    float hh[4] = { p->hue_h0, p->hue_h1, p->hue_h2, p->hue_h3 };
-    _recenter_hue(hh, h_picked);
-    p->hue_h0 = hh[0]; p->hue_h1 = hh[1]; p->hue_h2 = hh[2]; p->hue_h3 = hh[3];
+    // hue: center the arc on the picked hue (widths kept)
+    p->hue_center = h_picked;
+    dt_bauhaus_slider_set(g->hue_center, p->hue_center);
+    // chroma / lightness: recenter the linear ranges on the picked color (widths kept)
     float ch[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
     _recenter_linear(ch, _chroma_axis(c_picked));
     p->chroma_h0 = ch[0]; p->chroma_h1 = ch[1]; p->chroma_h2 = ch[2]; p->chroma_h3 = ch[3];
     float lh[4] = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
     _recenter_linear(lh, _light_axis(Y_picked));
     p->light_h0 = lh[0]; p->light_h1 = lh[1]; p->light_h2 = lh[2]; p->light_h3 = lh[3];
-    double dh[4] = { hh[0], hh[1], hh[2], hh[3] };
     double dc[4] = { ch[0], ch[1], ch[2], ch[3] };
     double dl[4] = { lh[0], lh[1], lh[2], lh[3] };
-    dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->hue_slider), dh);
     dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->chroma_slider), dc);
     dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->light_slider), dl);
   } else if(picker == g->target_hue_picker) {
@@ -873,8 +862,12 @@ static void _slider_changed_cb(GtkWidget *widget, gpointer user_data) {
   
   const float val = dt_bauhaus_slider_get(widget);
   
-  // Correction (selection ranges are handled by _range_changed_cb)
-  if (widget == g->target_hue_slider) {
+  // Hue arc (chroma/lightness ranges are handled by _range_changed_cb)
+  if (widget == g->hue_center) p->hue_center = val;
+  else if (widget == g->hue_plateau) p->hue_plateau = val;
+  else if (widget == g->hue_falloff) p->hue_falloff = val;
+  // Correction
+  else if (widget == g->target_hue_slider) {
     p->target_hue = val;
     _paint_chroma_slider(g->target_chroma, val);
     _paint_hue_priority_slider(g->priority_h, val);
@@ -970,11 +963,13 @@ void gui_update(dt_iop_module_t *self) {
   dt_iop_coloruniformityv2_params_t *p = self->params;
   ++darktable.gui->reset;
   
-  // Selection ranges (4-handle gradient sliders)
-  double dh[4] = { p->hue_h0, p->hue_h1, p->hue_h2, p->hue_h3 };
+  // Hue arc (temp sliders)
+  dt_bauhaus_slider_set(g->hue_center, p->hue_center);
+  dt_bauhaus_slider_set(g->hue_plateau, p->hue_plateau);
+  dt_bauhaus_slider_set(g->hue_falloff, p->hue_falloff);
+  // Chroma / lightness ranges (4-handle gradient sliders)
   double dc[4] = { p->chroma_h0, p->chroma_h1, p->chroma_h2, p->chroma_h3 };
   double dl[4] = { p->light_h0, p->light_h1, p->light_h2, p->light_h3 };
-  dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->hue_slider), dh);
   dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->chroma_slider), dc);
   dtgtk_gradient_slider_multivalue_set_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->light_slider), dl);
   // Correction
@@ -1034,9 +1029,7 @@ static void _range_changed_cb(GtkWidget *widget, gpointer user_data)
   dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
   double v[4];
   dtgtk_gradient_slider_multivalue_get_values(DTGTK_GRADIENT_SLIDER_MULTIVALUE(widget), v);
-  if(widget == g->hue_slider)
-  { p->hue_h0 = v[0]; p->hue_h1 = v[1]; p->hue_h2 = v[2]; p->hue_h3 = v[3]; }
-  else if(widget == g->chroma_slider)
+  if(widget == g->chroma_slider)
   { p->chroma_h0 = v[0]; p->chroma_h1 = v[1]; p->chroma_h2 = v[2]; p->chroma_h3 = v[3]; }
   else if(widget == g->light_slider)
   { p->light_h0 = v[0]; p->light_h1 = v[1]; p->light_h2 = v[2]; p->light_h3 = v[3]; }
@@ -1105,23 +1098,43 @@ void gui_init(dt_iop_module_t *self)
 
   dt_gui_box_add(page_sel, dt_ui_section_label_new(_("selection ranges")));
 
-  // Each channel: a 4-handle parametric range (2 inner = plateau, 2 outer = falloff).
-  dt_gui_box_add(page_sel, dt_ui_label_new(_("hue")));
-  g->hue_slider = _create_range_slider(self);
-  gtk_widget_set_tooltip_text(g->hue_slider,
-    _("hue selection range (circular). inner handles: full weight;\n"
-      "outer handles: falloff to zero"));
-  dt_gui_box_add(page_sel, g->hue_slider);
+  // HUE: symmetric circular arc (center + plateau/falloff half-widths).
+  // Temporary sliders -- a circular ring widget will replace them; the model
+  // already selects wrapping arcs (e.g. reds around 0 deg) correctly.
+  dt_gui_box_add(page_sel, dt_ui_label_new(_("hue (circular arc)")));
+  g->hue_center  = _create_manual_slider(self, _("hue center"), 0.0f, 1.0f, 0.001f, 0.08f, 1, "°", 360.0f);
+  _paint_hue_slider(g->hue_center);
+  dt_gui_box_add(page_sel, g->hue_center);
+  g->hue_plateau = _create_manual_slider(self, _("hue plateau"), 0.0f, 0.5f, 0.001f, 0.5f, 1, "°", 360.0f);
+  gtk_widget_set_tooltip_text(g->hue_plateau, _("half-width of the full-weight hue arc"));
+  dt_gui_box_add(page_sel, g->hue_plateau);
+  g->hue_falloff = _create_manual_slider(self, _("hue falloff"), 0.0f, 0.5f, 0.001f, 0.0f, 1, "°", 360.0f);
+  gtk_widget_set_tooltip_text(g->hue_falloff, _("extra half-width of the hue transition to zero"));
+  dt_gui_box_add(page_sel, g->hue_falloff);
 
+  // CHROMA: linear 4-handle range + gray->saturated gradient reference
   dt_gui_box_add(page_sel, dt_ui_label_new(_("chroma")));
   g->chroma_slider = _create_range_slider(self);
+  {
+    GtkDarktableGradientSlider *s = DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->chroma_slider);
+    GdkRGBA g0 = { 0.5, 0.5, 0.5, 1.0 }, g1 = { 0.9, 0.2, 0.2, 1.0 };
+    dtgtk_gradient_slider_multivalue_set_stop(s, 0.0, g0);
+    dtgtk_gradient_slider_multivalue_set_stop(s, 1.0, g1);
+  }
   gtk_widget_set_tooltip_text(g->chroma_slider,
     _("chroma (saturation) selection range.\n"
       "the low handles also exclude neutral/gray pixels"));
   dt_gui_box_add(page_sel, g->chroma_slider);
 
+  // LIGHTNESS: linear 4-handle range + black->white gradient reference
   dt_gui_box_add(page_sel, dt_ui_label_new(_("lightness")));
   g->light_slider = _create_range_slider(self);
+  {
+    GtkDarktableGradientSlider *s = DTGTK_GRADIENT_SLIDER_MULTIVALUE(g->light_slider);
+    GdkRGBA b0 = { 0.0, 0.0, 0.0, 1.0 }, b1 = { 1.0, 1.0, 1.0, 1.0 };
+    dtgtk_gradient_slider_multivalue_set_stop(s, 0.0, b0);
+    dtgtk_gradient_slider_multivalue_set_stop(s, 1.0, b1);
+  }
   gtk_widget_set_tooltip_text(g->light_slider,
     _("lightness selection range (perceptual)"));
   dt_gui_box_add(page_sel, g->light_slider);
