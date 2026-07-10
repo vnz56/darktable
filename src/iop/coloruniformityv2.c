@@ -914,6 +914,29 @@ static void _gamut_profile_changed(GtkWidget *widget, gpointer user_data)
   }
 }
 
+// Convenience: pick, in the combobox above, whatever profile is currently the
+// global soft-proof. Same profile list (both come from color/out), so it maps
+// directly. Selecting the combobox fires _gamut_profile_changed (params + history).
+static void _gamut_use_softproof_clicked(GtkWidget *widget, gpointer user_data)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
+  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
+  const dt_colorspaces_color_profile_type_t sp_type = darktable.color_profiles->softproof_type;
+  const char *sp_file = darktable.color_profiles->softproof_filename;
+  int pos = 0; // fallback: "none" if the soft-proof profile is not output-eligible
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *pp = l->data;
+    if(pp->out_pos > -1 && pp->type == sp_type && !strcmp(pp->filename, sp_file))
+    {
+      pos = pp->out_pos + 1;
+      break;
+    }
+  }
+  dt_bauhaus_combobox_set(g->gamut_profile, pos);
+}
+
 void gui_update(dt_iop_module_t *self) {
   dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
   dt_iop_coloruniformityv2_params_t *p = self->params;
@@ -1251,6 +1274,12 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(G_OBJECT(g->gamut_profile), "value-changed",
                    G_CALLBACK(_gamut_profile_changed), (gpointer)self);
   dt_gui_box_add(page_gamut, g->gamut_profile);
+
+  GtkWidget *sp_btn = gtk_button_new_with_label(_("use soft-proof profile"));
+  gtk_widget_set_tooltip_text(sp_btn,
+    _("copy the profile currently set as the global soft-proof into the selector above."));
+  g_signal_connect(G_OBJECT(sp_btn), "clicked", G_CALLBACK(_gamut_use_softproof_clicked), (gpointer)self);
+  dt_gui_box_add(page_gamut, sp_btn);
 
   dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("gamut compression")));
   g->gamut_amount = _create_manual_slider(self, _("compression"), 0.0f, 1.0f, 0.01f, 0.0f, 2, "%", 100.0f);
