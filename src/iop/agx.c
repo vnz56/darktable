@@ -17,6 +17,7 @@
 */
 
 #include "bauhaus/bauhaus.h"
+#include "common/chromatic_adaptation.h"
 #include "common/colorspaces.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/custom_primaries.h"
@@ -39,7 +40,7 @@
 #include <pango/pangocairo.h>
 #include <stdlib.h>
 
-DT_MODULE_INTROSPECTION(9, dt_iop_agx_params_t)
+DT_MODULE_INTROSPECTION(10, dt_iop_agx_params_t)
 
 const char *name()
 {
@@ -102,7 +103,7 @@ typedef struct dt_iop_agx_params_t
   float look_slope;                  // $MIN: 0.f $MAX: 10.f $DEFAULT: 1.f $DESCRIPTION: "slope"
   float look_brightness;             // $MIN: 0.f $MAX: 100.f $DEFAULT: 1.f $DESCRIPTION: "brightness"
   float look_saturation;             // $MIN: 0.f $MAX: 10.f $DEFAULT: 1.f $DESCRIPTION: "saturation"
-  float look_original_hue_mix_ratio; // $MIN: 0.f $MAX: 1.f $DEFAULT: 0.6f $DESCRIPTION: "preserve hue"
+  float look_original_hue_mix_ratio; // $MIN: 0.f $MAX: 1.f $DEFAULT: 0.6f $DESCRIPTION: "restore hue after curve"
 
   // log mapping
   float range_black_relative_ev;  // $MIN: -20.f $MAX: -0.1f  $DEFAULT: -10.f $DESCRIPTION: "black relative exposure"
@@ -159,6 +160,14 @@ typedef struct dt_iop_agx_params_t
 
   // v9
   float shadow_desat_pivot_ev;  // $MIN: -6.f $MAX: 6.f $DEFAULT: 0.f $DESCRIPTION: "shadow desaturation range"
+
+  // v10 -- paper-gamut compression, applied as the final display-referred stage
+  // (after the look and the outset matrix, i.e. the last op of this terminal module).
+  // The paper profile is owned by the edit -> reproducible and applied on export.
+  dt_colorspaces_color_profile_type_t gamut_profile_type; // $DEFAULT: DT_COLORSPACE_NONE $DESCRIPTION: "gamut paper profile"
+  char gamut_profile_filename[DT_IOP_COLOR_ICC_LEN];
+  float gamut_amount;    // $MIN: 0.f $MAX: 1.f $DEFAULT: 0.f $DESCRIPTION: "gamut compression"
+  float gamut_threshold; // $MIN: 0.2f $MAX: 1.f $DEFAULT: 0.8f $DESCRIPTION: "gamut threshold"
 } dt_iop_agx_params_t;
 
 typedef struct dt_iop_basic_curve_controls_t
@@ -207,6 +216,9 @@ typedef struct dt_iop_agx_gui_data_t
   GtkWidget *post_curve_primaries_controls_vbox;
   GtkWidget *set_post_curve_primaries_from_pre_button;
   GtkWidget *set_black_from_softproof_button;
+
+  // --- Gamut (paper) compression ---
+  GtkWidget *gamut_profile;
 
   // --- Mouse interaction on the curve ---
   gboolean dragging;
@@ -291,10 +303,24 @@ typedef struct primaries_params_t
   float unrotation[3];
 } primaries_params_t;
 
+#define AGX_GAMUT_LUT_NH 48
+#define AGX_GAMUT_LUT_NY 32
+#define AGX_GAMUT_LUT_YMAX 1.1f
+// Compress toward a fraction of the measured boundary (the Yrg device-cube
+// boundary over-estimates the true ICC gamut) so results land safely inside.
+#define AGX_GAMUT_SAFETY 0.95f
 typedef struct dt_iop_agx_data_t
 {
   tone_mapping_params_t tone_mapping_params;
   primaries_params_t primaries_params;
+  // paper-gamut boundary chroma_max(hue, Y) in Yrg Ych, built from the edit's
+  // paper profile in commit_params; used by the final display-referred compression.
+  float gamut_chroma_max[AGX_GAMUT_LUT_NH][AGX_GAMUT_LUT_NY];
+  gboolean gamut_lut_valid;
+  dt_colorspaces_color_profile_type_t gamut_lut_profile_type;
+  char gamut_lut_profile[512];
+  float gamut_amount;
+  float gamut_threshold;
 } dt_iop_agx_data_t;
 
 static void _set_scene_referred_default_params(dt_iop_agx_params_t *p);
@@ -341,6 +367,22 @@ int legacy_params(dt_iop_module_t *self,
     *new_params = np;
     *new_params_size = sizeof(dt_iop_agx_params_t);
     *new_version = 9;
+    return 0;
+  }
+
+  if(old_version == 9)
+  {
+    // v10 appends paper-gamut compression params at the end of the struct.
+    dt_iop_agx_params_t *np = calloc(1, sizeof(dt_iop_agx_params_t));
+    memcpy(np, old_params, offsetof(dt_iop_agx_params_t, gamut_profile_type));
+    // DT_COLORSPACE_NONE is -1, so it must be set explicitly (calloc gives 0).
+    np->gamut_profile_type = DT_COLORSPACE_NONE;
+    np->gamut_profile_filename[0] = '\0';
+    np->gamut_amount = 0.f;      // off -> no behaviour change for existing edits
+    np->gamut_threshold = 0.8f;
+    *new_params = np;
+    *new_params_size = sizeof(dt_iop_agx_params_t);
+    *new_version = 10;
     return 0;
   }
 
@@ -687,44 +729,9 @@ static inline float _lerp_hue(const float original_hue,
   return mixed_hue - floorf(mixed_hue);
 }
 
-static inline float _apply_slope_lift(const float x,
-                                        const float slope,
-                                        const float lift)
-{
-  // https://www.desmos.com/calculator/8a26bc7eb8
-  const float m = slope / (1.f + lift);
-  const float b = lift * m;
-  // m * x + b
-  return DT_FMA(m, x, b);
-}
-
-DT_OMP_DECLARE_SIMD(aligned(pixel_in_out : 16))
-static inline void _agx_look(dt_aligned_pixel_t pixel_in_out,
-                             const tone_mapping_params_t *params,
-                             const dt_colormatrix_t rendering_to_xyz_transposed)
-{
-  const float slope = params->look_slope;
-  const float lift = params->look_lift;
-  const float power = params->look_power;
-  const float sat = params->look_saturation;
-
-  for_three_channels(k, aligned(pixel_in_out : 16))
-  {
-    const float value_with_slope_and_lift = _apply_slope_lift(pixel_in_out[k], slope, lift);
-    pixel_in_out[k] =
-      value_with_slope_and_lift > 0.f
-      ? powf(value_with_slope_and_lift, power)
-      : value_with_slope_and_lift;
-  }
-
-  const float luma = _luminance_from_matrix(pixel_in_out, rendering_to_xyz_transposed);
-
-  // saturation
-  for_three_channels(k, aligned(pixel_in_out : 16))
-  {
-    pixel_in_out[k] = luma + sat * (pixel_in_out[k] - luma);
-  }
-}
+// The display-referred grade (slope/lift/brightness/saturation, formerly "look")
+// has been removed: AgX is a scene->display tone mapper, grading belongs to a
+// separate downstream operation. Only the curve's own hue restoration remains.
 
 static inline float _apply_log_encoding(const float x,
                                         const float range_in_ev,
@@ -1162,9 +1169,6 @@ static void _agx_tone_mapping(dt_aligned_pixel_t rgb_in_out,
     transformed_pixel[k] = _apply_curve(log_value, params);
   }
 
-  if(params->look_tuned)
-    _agx_look(transformed_pixel, params, rendering_to_xyz_transposed);
-
   // Linearize
   for_three_channels(k, aligned(transformed_pixel : 16))
   {
@@ -1467,6 +1471,140 @@ static void agx_compute_histogram(dt_iop_module_t *self,
   if(g->graph_drawing_area)
     gtk_widget_queue_draw(GTK_WIDGET(g->graph_drawing_area));
 }
+// ============================================================================
+// Paper-gamut compression -- the final display-referred stage of this terminal
+// module. Builds a chroma_max(hue, Y) LUT in Yrg Ych from the edit's paper
+// profile, then (after the look and the outset) softly compresses chroma that
+// overshoots that boundary back toward it. In-gamut chroma is protected.
+// Ported from the coloruniformity module.
+// ============================================================================
+static inline float _agx_wrap_hue(float h) { h -= floorf(h); return h; }
+
+static void _agx_lab_to_ych(const cmsCIELab *lab, const float rn, const float gn,
+                            float *Yout, float *cout, float *hout)
+{
+  cmsCIEXYZ xyz;
+  cmsLab2XYZ(cmsD50_XYZ(), &xyz, lab);
+  dt_aligned_pixel_t xyz50 = { (float)xyz.X, (float)xyz.Y, (float)xyz.Z, 0.f }, xyz65, plms, pyrg;
+  XYZ_D50_to_D65(xyz50, xyz65);
+  dt_apply_transposed_color_matrix(xyz65, XYZ_D65_to_LMS_2006_D65_trans, plms);
+  LMS_to_Yrg(plms, pyrg);
+  *Yout = pyrg[0];
+  const float dr = pyrg[1] - rn, dg = pyrg[2] - gn;
+  *cout = sqrtf(dr * dr + dg * dg);
+  *hout = _agx_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
+}
+
+// D65 neutral chromaticity in Yrg (r,g).
+static inline void _agx_yrg_neutral(float *rn, float *gn)
+{
+  const dt_aligned_pixel_t d65_xyz = { 0.95047f, 1.f, 1.08883f, 0.f };
+  dt_aligned_pixel_t d65_lms, d65_yrg;
+  dt_apply_transposed_color_matrix(d65_xyz, XYZ_D65_to_LMS_2006_D65_trans, d65_lms);
+  LMS_to_Yrg(d65_lms, d65_yrg);
+  *rn = d65_yrg[1];
+  *gn = d65_yrg[2];
+}
+
+static void _agx_build_gamut_lut(dt_iop_agx_data_t *d,
+                                 const dt_colorspaces_color_profile_type_t type,
+                                 const char *filename)
+{
+  d->gamut_lut_valid = FALSE;
+  memset(d->gamut_chroma_max, 0, sizeof(d->gamut_chroma_max));
+  const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
+      type, filename,
+      DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
+  if(!prof || !prof->profile) return;
+
+  cmsHPROFILE lab = cmsCreateLab4Profile(NULL);
+  cmsHTRANSFORM tr = cmsCreateTransform(prof->profile, TYPE_RGB_DBL, lab, TYPE_Lab_DBL,
+                                        INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_NOCACHE);
+  cmsCloseProfile(lab);
+  if(!tr) return;
+
+  float rn, gn;
+  _agx_yrg_neutral(&rn, &gn);
+
+  const int N = 48; // device cube surface sampling
+  for(int face = 0; face < 6; face++)
+  {
+    const int fixed = face / 2;
+    const double fv = (face % 2) ? 1.0 : 0.0;
+    for(int i = 0; i <= N; i++)
+      for(int j = 0; j <= N; j++)
+      {
+        const double u = (double)i / N, w = (double)j / N;
+        double rgb[3];
+        if(fixed == 0) { rgb[0] = fv; rgb[1] = u; rgb[2] = w; }
+        else if(fixed == 1) { rgb[0] = u; rgb[1] = fv; rgb[2] = w; }
+        else { rgb[0] = u; rgb[1] = w; rgb[2] = fv; }
+        cmsCIELab l;
+        cmsDoTransform(tr, rgb, &l, 1);
+        float Y, c, h;
+        _agx_lab_to_ych(&l, rn, gn, &Y, &c, &h);
+        int hb = (int)(h * AGX_GAMUT_LUT_NH); hb = CLAMP(hb, 0, AGX_GAMUT_LUT_NH - 1);
+        int yb = (int)(Y / AGX_GAMUT_LUT_YMAX * AGX_GAMUT_LUT_NY); yb = CLAMP(yb, 0, AGX_GAMUT_LUT_NY - 1);
+        if(c > d->gamut_chroma_max[hb][yb]) d->gamut_chroma_max[hb][yb] = c;
+      }
+  }
+  cmsDeleteTransform(tr);
+  d->gamut_lut_valid = TRUE;
+  d->gamut_lut_profile_type = type;
+  g_strlcpy(d->gamut_lut_profile, filename, sizeof(d->gamut_lut_profile));
+}
+
+static inline float _agx_gamut_cmax(const dt_iop_agx_data_t *d, const float hue, const float Y)
+{
+  if(!d->gamut_lut_valid) return 0.f;
+  const int hb = CLAMP((int)(_agx_wrap_hue(hue) * AGX_GAMUT_LUT_NH), 0, AGX_GAMUT_LUT_NH - 1);
+  const int yb = CLAMP((int)(CLAMPF(Y, 0.f, AGX_GAMUT_LUT_YMAX) / AGX_GAMUT_LUT_YMAX * AGX_GAMUT_LUT_NY),
+                       0, AGX_GAMUT_LUT_NY - 1);
+  return d->gamut_chroma_max[hb][yb];
+}
+
+// Compress the chroma of one pipe-working-space RGB pixel toward the paper
+// boundary. work_in_T: working RGB -> XYZ(D50); work_out_T: XYZ(D50) -> working RGB.
+static inline void _agx_apply_gamut(float *const restrict rgb,
+                                    const dt_iop_agx_data_t *const d,
+                                    const float amount, const float threshold,
+                                    const float rn, const float gn,
+                                    const dt_colormatrix_t work_in_T,
+                                    const dt_colormatrix_t work_out_T)
+{
+  const dt_aligned_pixel_t rgb4 = { rgb[0], rgb[1], rgb[2], 0.f };
+  dt_aligned_pixel_t xyz50, xyz65, lms, yrg;
+  dt_apply_transposed_color_matrix(rgb4, work_in_T, xyz50);
+  XYZ_D50_to_D65(xyz50, xyz65);
+  dt_apply_transposed_color_matrix(xyz65, XYZ_D65_to_LMS_2006_D65_trans, lms);
+  LMS_to_Yrg(lms, yrg);
+  const float Y = yrg[0];
+  const float dr = yrg[1] - rn, dg = yrg[2] - gn;
+  const float c = sqrtf(dr * dr + dg * dg);
+  if(c <= 1e-5f) return;
+  const float h = _agx_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
+  const float cmax = _agx_gamut_cmax(d, h, Y);
+  if(cmax <= 1e-4f) return;
+  const float sc = AGX_GAMUT_SAFETY * cmax; // target boundary, safely inside the gamut
+  const float knee = threshold * sc;
+  if(c <= knee) return;
+  const float range = fmaxf(sc - knee, 1e-4f);
+  const float over = c - knee;
+  const float target_c = knee + range * (over / (over + range)); // soft asymptote to sc
+  const float c_new = c + amount * (target_c - c);
+  const float ratio = c_new / c;
+  yrg[1] = rn + dr * ratio;
+  yrg[2] = gn + dg * ratio;
+  dt_aligned_pixel_t lms2, xyz65b, xyz50b, rgbout;
+  Yrg_to_LMS(yrg, lms2);
+  dt_apply_transposed_color_matrix(lms2, LMS_2006_D65_to_XYZ_D65_trans, xyz65b);
+  XYZ_D65_to_D50(xyz65b, xyz50b);
+  dt_apply_transposed_color_matrix(xyz50b, work_out_T, rgbout);
+  rgb[0] = rgbout[0];
+  rgb[1] = rgbout[1];
+  rgb[2] = rgbout[2];
+}
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,
@@ -1516,6 +1654,11 @@ void process(dt_iop_module_t *self,
 
   const gboolean base_working_same_profile = pipe_work_profile == base_profile;
 
+  // Final display-referred paper-gamut compression (after the look and the outset).
+  const gboolean do_gamut = d->gamut_amount > 0.f && d->gamut_lut_valid;
+  float gamut_rn = 0.f, gamut_gn = 0.f;
+  if(do_gamut) _agx_yrg_neutral(&gamut_rn, &gamut_gn);
+
   DT_OMP_FOR()
   for(size_t k = 0; k < 4 * n_pixels; k += 4)
   {
@@ -1551,6 +1694,13 @@ void process(dt_iop_module_t *self,
 
     // Convert from internal rendering space back to pipe working space
     dt_apply_transposed_color_matrix(rendering_rgb, rendering_to_pipe_transposed, pix_out);
+
+    // Last op of this terminal module: compress chroma back into the paper gamut.
+    if(do_gamut)
+      _agx_apply_gamut(pix_out, d, d->gamut_amount, d->gamut_threshold,
+                       gamut_rn, gamut_gn,
+                       pipe_work_profile->matrix_in_transposed,
+                       pipe_work_profile->matrix_out_transposed);
 
     // Copy over the alpha channel
     pix_out[3] = sanitised_in[3];
@@ -2336,62 +2486,6 @@ static GtkWidget* _create_basic_curve_controls_box(dt_iop_module_t *self,
   return box;
 }
 
-static void _add_look_sliders(dt_iop_module_t *section)
-{
-  // Reuse the slider variable for all sliders instead of creating new ones in each scope
-  GtkWidget *slider = NULL;
-
-  slider = dt_bauhaus_slider_from_params(section, "look_slope");
-  dt_bauhaus_slider_set_soft_range(slider, 0.f, 2.f);
-  gtk_widget_set_tooltip_text(slider, _("decrease or increase contrast and brightness"));
-
-  slider = dt_bauhaus_slider_from_params(section, "look_lift");
-  dt_bauhaus_slider_set_digits(slider, 2);
-  dt_bauhaus_slider_set_soft_range(slider, -0.5f, 0.5f);
-  gtk_widget_set_tooltip_text(slider, _("deepen or lift shadows"));
-
-  slider = dt_bauhaus_slider_from_params(section, "look_brightness");
-  dt_bauhaus_slider_set_soft_range(slider, 0.f, 2.f);
-  gtk_widget_set_tooltip_text(slider, _("increase or decrease brightness"));
-
-  slider = dt_bauhaus_slider_from_params(section, "look_saturation");
-  dt_bauhaus_slider_set_format(slider, "%");
-  dt_bauhaus_slider_set_digits(slider, 2);
-  dt_bauhaus_slider_set_factor(slider, 100.f);
-  dt_bauhaus_slider_set_soft_range(slider, 0.f, 2.f);
-  gtk_widget_set_tooltip_text(slider, _("decrease or increase saturation"));
-
-  slider = dt_bauhaus_slider_from_params(section, "look_original_hue_mix_ratio");
-  dt_bauhaus_slider_set_format(slider, "%");
-  dt_bauhaus_slider_set_digits(slider, 2);
-  dt_bauhaus_slider_set_factor(slider, 100.f);
-  gtk_widget_set_tooltip_text(slider, _("increase to bring hues closer to the original"));
-}
-
-static void _add_look_box(dt_iop_module_t *self,
-                          dt_iop_agx_gui_data_t *g)
-{
-  const gboolean look_always_visible = dt_conf_get_bool("plugins/darkroom/agx/look_always_visible");
-
-  GtkWidget *look_box = dt_gui_vbox();
-
-  gchar *section_name = NC_("section", "look");
-  if(look_always_visible)
-  {
-    dt_gui_box_add(look_box, dt_ui_section_label_new(Q_(section_name)));
-    _add_look_sliders(DT_IOP_SECTION_FOR_PARAMS(self, section_name, look_box));
-  }
-  else
-  {
-    dt_gui_new_collapsible_section(&g->look_section,
-                                   "plugins/darkroom/agx/expand_look_params", Q_(section_name),
-                                   GTK_BOX(look_box), DT_ACTION(self));
-    _add_look_sliders(DT_IOP_SECTION_FOR_PARAMS(self, section_name, g->look_section.container));
-  }
-
-  dt_gui_box_add(self->widget, look_box);
-}
-
 static GtkWidget* _create_curve_graph_box(dt_iop_module_t *self,
                                           dt_iop_agx_gui_data_t *g)
 {
@@ -2534,6 +2628,19 @@ static GtkWidget* _create_advanced_box(dt_iop_module_t *self,
        "0 EV (default): desaturation fades out exactly at mid-gray.\n"
        "positive values: extend desaturation into the midtones.\n"
        "negative values: restrict desaturation to deeper shadows only."));
+
+  // Restore hue after the per-channel curve (formerly under "look"). This is core
+  // tone-mapping behaviour, not a grade: the per-channel sigmoid skews hue, and
+  // this blends the post-curve hue back toward the pre-curve (scene) hue.
+  slider = dt_bauhaus_slider_from_params(section, "look_original_hue_mix_ratio");
+  dt_bauhaus_slider_set_format(slider, "%");
+  dt_bauhaus_slider_set_digits(slider, 2);
+  dt_bauhaus_slider_set_factor(slider, 100.f);
+  gtk_widget_set_tooltip_text
+    (slider,
+     _("the per-channel tone curve skews hue (bright saturated colours drift).\n"
+       "this blends the post-curve hue back toward the pre-curve (scene) hue.\n"
+       "0%: keep the curve's hue skew.  100%: fully restore the original hue."));
 
   return advanced_box;
 }
@@ -2800,6 +2907,20 @@ void gui_update(dt_iop_module_t *self)
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->completely_reverse_primaries),
                                p->completely_reverse_primaries);
 
+  // paper-profile combobox (pos 0 = none; real profiles at out_pos + 1)
+  dt_bauhaus_combobox_set(g->gamut_profile, 0);
+  if(p->gamut_profile_type != DT_COLORSPACE_NONE)
+    for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+    {
+      dt_colorspaces_color_profile_t *pp = l->data;
+      if(pp->out_pos > -1 && pp->type == p->gamut_profile_type
+         && !strcmp(pp->filename, p->gamut_profile_filename))
+      {
+        dt_bauhaus_combobox_set(g->gamut_profile, pp->out_pos + 1);
+        break;
+      }
+    }
+
   _update_redraw_dynamic_gui(self, g, p);
 
   gui_changed(self, NULL, NULL);
@@ -2998,6 +3119,103 @@ static void _notebook_page_changed(GtkNotebook *notebook,
   }
 }
 
+// Paper-profile combobox for the gamut page: pos 0 = "none" (DT_COLORSPACE_NONE,
+// compression off); real profiles are at out_pos + 1.
+static void _agx_gamut_profile_changed(GtkWidget *widget, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_agx_params_t *p = self->params;
+  const int pos = dt_bauhaus_combobox_get(widget);
+  if(pos <= 0)
+  {
+    p->gamut_profile_type = DT_COLORSPACE_NONE;
+    p->gamut_profile_filename[0] = '\0';
+    dt_dev_add_history_item(darktable.develop, self, TRUE);
+    return;
+  }
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *pp = l->data;
+    if(pp->out_pos == pos - 1)
+    {
+      p->gamut_profile_type = pp->type;
+      g_strlcpy(p->gamut_profile_filename, pp->filename, sizeof(p->gamut_profile_filename));
+      dt_dev_add_history_item(darktable.develop, self, TRUE);
+      return;
+    }
+  }
+}
+
+// Copy whatever profile is currently the global soft-proof into the selector
+// above (both draw from the same output profile list, so it maps directly).
+static void _agx_gamut_use_softproof(GtkWidget *widget, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_agx_gui_data_t *g = self->gui_data;
+  const dt_colorspaces_color_profile_type_t sp_type = darktable.color_profiles->softproof_type;
+  const char *sp_file = darktable.color_profiles->softproof_filename;
+  int pos = 0; // fallback: "none" if the soft-proof profile is not output-eligible
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *pp = l->data;
+    if(pp->out_pos > -1 && pp->type == sp_type && !strcmp(pp->filename, sp_file))
+    {
+      pos = pp->out_pos + 1;
+      break;
+    }
+  }
+  dt_bauhaus_combobox_set(g->gamut_profile, pos);
+}
+
+static void _create_gamut_page(dt_iop_module_t *main, dt_iop_agx_gui_data_t *g)
+{
+  GtkWidget *page_gamut =
+    dt_ui_notebook_page(g->notebook, N_("gamut"), _("compress out-of-gamut chroma to the paper gamut"));
+
+  dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("paper profile")));
+
+  g->gamut_profile = dt_bauhaus_combobox_new(main);
+  dt_bauhaus_widget_set_label(g->gamut_profile, NULL, N_("paper profile"));
+  dt_bauhaus_combobox_add(g->gamut_profile, _("none")); // pos 0 -> DT_COLORSPACE_NONE
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *prof = l->data;
+    if(prof->out_pos > -1) dt_bauhaus_combobox_add(g->gamut_profile, prof->name);
+  }
+  gtk_widget_set_tooltip_text(g->gamut_profile,
+    _("paper/output profile whose gamut is the compression target.\n"
+      "stored in the edit (independent of the global soft-proof), so the result\n"
+      "is reproducible and applied on export. 'none' disables compression.\n"
+      "for a coherent result, set this to the same profile as 'output color profile'."));
+  g_signal_connect(G_OBJECT(g->gamut_profile), "value-changed",
+                   G_CALLBACK(_agx_gamut_profile_changed), main);
+  dt_gui_box_add(page_gamut, g->gamut_profile);
+
+  GtkWidget *sp_btn = gtk_button_new_with_label(_("use soft-proof profile"));
+  gtk_widget_set_tooltip_text(sp_btn,
+    _("copy the profile currently set as the global soft-proof into the selector above."));
+  g_signal_connect(G_OBJECT(sp_btn), "clicked", G_CALLBACK(_agx_gamut_use_softproof), main);
+  dt_gui_box_add(page_gamut, sp_btn);
+
+  dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("gamut compression")));
+
+  dt_iop_module_t *section = DT_IOP_SECTION_FOR_PARAMS(main, NULL, page_gamut);
+  GtkWidget *slider = dt_bauhaus_slider_from_params(section, "gamut_amount");
+  dt_bauhaus_slider_set_format(slider, "%");
+  dt_bauhaus_slider_set_factor(slider, 100.f);
+  gtk_widget_set_tooltip_text(slider,
+    _("compress chroma that overshoots the selected paper gamut back toward its\n"
+      "boundary (in-gamut is protected). needs a paper profile set above.\n"
+      "applied as the last step of AgX, so it accounts for the whole tone map + look."));
+
+  slider = dt_bauhaus_slider_from_params(section, "gamut_threshold");
+  dt_bauhaus_slider_set_format(slider, "%");
+  dt_bauhaus_slider_set_factor(slider, 100.f);
+  gtk_widget_set_tooltip_text(slider,
+    _("fraction of the paper boundary where compression starts.\n"
+      "lower = a wider soft roll-off; 100% = compress only what is beyond the boundary."));
+}
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_agx_gui_data_t *g = IOP_GUI_ALLOC(agx);
@@ -3037,8 +3255,8 @@ g->histogram_cliplo = g->histogram_cliphi = g->histogram_total = 0;
                                     g->curve_advanced_controls_box);
 
   // Finally, add the remaining sections to the settings page
-  _add_look_box(settings_section, g);
   _create_primaries_page(self, g);
+  _create_gamut_page(self, g);
 }
 
 static void _set_default_curve_and_look_params(dt_iop_agx_params_t *p)
@@ -3259,6 +3477,16 @@ void commit_params(dt_iop_module_t *self,
   // Calculate curve parameters once
   processing_params->tone_mapping_params = _calculate_tone_mapping_params(p);
   processing_params->primaries_params = _get_primaries_params(p);
+
+  // Paper-gamut compression: copy live params, (re)build the LUT only when the
+  // compression is active and the paper profile changed.
+  processing_params->gamut_amount = p->gamut_amount;
+  processing_params->gamut_threshold = p->gamut_threshold;
+  if(p->gamut_amount > 0.f
+     && (!processing_params->gamut_lut_valid
+         || processing_params->gamut_lut_profile_type != p->gamut_profile_type
+         || strcmp(processing_params->gamut_lut_profile, p->gamut_profile_filename) != 0))
+    _agx_build_gamut_lut(processing_params, p->gamut_profile_type, p->gamut_profile_filename);
 }
 
 void reload_defaults(dt_iop_module_t *self)
@@ -3315,6 +3543,12 @@ int process_cl(dt_iop_module_t *self,
 
   const dt_iop_agx_global_data_t *gd = self->global_data;
   const dt_iop_agx_data_t *d = piece->data;
+
+  // The final paper-gamut compression is CPU-only for now: fall back to CPU for
+  // this module when it is active, so GPU and CPU results match.
+  if(d->gamut_amount > 0.f && d->gamut_lut_valid)
+    return DT_OPENCL_PROCESS_CL;
+
   cl_int err = CL_SUCCESS;
 
   const int devid = piece->pipe->devid;
