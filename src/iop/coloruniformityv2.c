@@ -19,7 +19,6 @@ V8 - Additions over V7:
 #include "bauhaus/bauhaus.h"
 #include "common/chromatic_adaptation.h"
 #include "common/colorspaces.h"
-#include <lcms2.h>
 #include "common/colorspaces_inline_conversions.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
@@ -83,12 +82,11 @@ typedef struct dt_iop_coloruniformityv2_params_t {
   float preserve_texture_c;  // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "Chroma Preserve Texture"
   float preserve_texture_l;  // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "Lightness Preserve Texture"
 
-  // --- GAMUT (OOG): compress out-of-gamut chroma toward the soft-proof paper
-  // boundary. gamut_amount = strength (0 = off), gamut_threshold = fraction of the
-  // boundary where compression starts (protect in-gamut below it). ---
+  // --- VESTIGIAL: the gamut (OOG) compression was moved to the AgX module (it
+  // must run display-referred, as the last op before the paper conversion). These
+  // fields are kept inert to preserve the params layout; they have no effect. ---
   float gamut_amount;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "gamut compression"
   float gamut_threshold;     // $MIN: 0.2 $MAX: 1.0 $DEFAULT: 0.8 $DESCRIPTION: "gamut threshold"
-  // Paper profile owned by the edit (NOT the global soft-proof): reproducible + works on export.
   dt_colorspaces_color_profile_type_t gamut_profile_type; // $DEFAULT: DT_COLORSPACE_NONE $DESCRIPTION: "gamut paper profile"
   char gamut_profile_filename[DT_IOP_COLOR_ICC_LEN];
 } dt_iop_coloruniformityv2_params_t;
@@ -96,18 +94,9 @@ typedef struct dt_iop_coloruniformityv2_params_t {
 
 DT_MODULE_INTROSPECTION(1, dt_iop_coloruniformityv2_params_t)
 
-// Gamut LUT: max reproducible chroma of the soft-proof paper, in Yrg Ych,
-// as a function of (hue, Y). Built at commit_params from the soft-proof profile.
-#define CU2_LUT_NH 24
-#define CU2_LUT_NY 20
-#define CU2_LUT_YMAX 1.1f   // Yrg Y axis span for the LUT
 typedef struct dt_iop_coloruniformityv2_data_t
 {
-  dt_iop_coloruniformityv2_params_t params;   // must be first (commit copies params here)
-  float chroma_max[CU2_LUT_NH][CU2_LUT_NY];   // paper gamut boundary, Yrg Ych
-  gboolean lut_valid;
-  dt_colorspaces_color_profile_type_t lut_profile_type; // profile the LUT was built for
-  char lut_profile[512];
+  dt_iop_coloruniformityv2_params_t params;
 } dt_iop_coloruniformityv2_data_t;
 
 
@@ -149,7 +138,6 @@ typedef struct dt_iop_coloruniformityv2_gui_data_t {
 
   GtkWidget *btn_bypass_hue, *btn_bypass_chroma, *btn_bypass_luma;
 
-  GtkWidget *gamut_amount, *gamut_threshold, *gamut_profile;
 
   GtkNotebook *notebook;
 
@@ -176,93 +164,6 @@ dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
 
 
 
-// --- Gamut LUT (soft-proof paper boundary) ---
-
-static inline float wrap_hue(float h);  // defined below with the other colour helpers
-
-// Lab (D50) -> Yrg Ych (Y, chroma, hue) using the module's working-space chain.
-static void _lab_to_ych(const cmsCIELab *lab, const float rn, const float gn,
-                        float *Yout, float *cout, float *hout)
-{
-  cmsCIEXYZ xyz;
-  cmsLab2XYZ(cmsD50_XYZ(), &xyz, lab);
-  dt_aligned_pixel_t xyz50 = { (float)xyz.X, (float)xyz.Y, (float)xyz.Z, 0.0f }, xyz65, plms, pyrg;
-  XYZ_D50_to_D65(xyz50, xyz65);
-  dt_colormatrix_t m;
-  dt_colormatrix_transpose(m, XYZ_D65_to_LMS_2006_D65);
-  dt_apply_transposed_color_matrix(xyz65, m, plms);
-  LMS_to_Yrg(plms, pyrg);
-  *Yout = pyrg[0];
-  const float dr = pyrg[1] - rn, dg = pyrg[2] - gn;
-  *cout = sqrtf(dr * dr + dg * dg);
-  *hout = wrap_hue(atan2f(dg, dr) / (2.0f * M_PI_F));
-}
-
-// Build chroma_max(hue, Y) from the current soft-proof profile by sampling the
-// printer device RGB cube surface (= the reproducible gamut boundary) into Yrg Ych.
-static void _build_gamut_lut(dt_iop_coloruniformityv2_data_t *d)
-{
-  d->lut_valid = FALSE;
-  memset(d->chroma_max, 0, sizeof(d->chroma_max));
-  // The paper profile is owned by the edit (params), independent of the global
-  // soft-proof, so the result is reproducible and applies on export too.
-  const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
-      d->params.gamut_profile_type, d->params.gamut_profile_filename,
-      DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
-  if(!prof || !prof->profile) return;
-
-  cmsHPROFILE lab = cmsCreateLab4Profile(NULL);
-  cmsHTRANSFORM tr = cmsCreateTransform(prof->profile, TYPE_RGB_DBL, lab, TYPE_Lab_DBL,
-                                        INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_NOCACHE);
-  cmsCloseProfile(lab);
-  if(!tr) return;
-
-  // D65 neutral in Yrg (r,g)
-  const dt_aligned_pixel_t d65_xyz = { 0.95047f, 1.0f, 1.08883f, 0.0f };
-  dt_colormatrix_t m;
-  dt_colormatrix_transpose(m, XYZ_D65_to_LMS_2006_D65);
-  dt_aligned_pixel_t d65_lms, d65_yrg;
-  dt_apply_transposed_color_matrix(d65_xyz, m, d65_lms);
-  LMS_to_Yrg(d65_lms, d65_yrg);
-  const float rn = d65_yrg[1], gn = d65_yrg[2];
-
-  const int N = 48; // device cube surface sampling
-  for(int face = 0; face < 6; face++)
-  {
-    const int fixed = face / 2;
-    const double fv = (face % 2) ? 1.0 : 0.0;
-    for(int i = 0; i <= N; i++)
-      for(int j = 0; j <= N; j++)
-      {
-        const double u = (double)i / N, w = (double)j / N;
-        double rgb[3];
-        if(fixed == 0) { rgb[0] = fv; rgb[1] = u; rgb[2] = w; }
-        else if(fixed == 1) { rgb[0] = u; rgb[1] = fv; rgb[2] = w; }
-        else { rgb[0] = u; rgb[1] = w; rgb[2] = fv; }
-        cmsCIELab l;
-        cmsDoTransform(tr, rgb, &l, 1);
-        float Y, c, h;
-        _lab_to_ych(&l, rn, gn, &Y, &c, &h);
-        int hb = (int)(h * CU2_LUT_NH); hb = CLAMP(hb, 0, CU2_LUT_NH - 1);
-        int yb = (int)(Y / CU2_LUT_YMAX * CU2_LUT_NY); yb = CLAMP(yb, 0, CU2_LUT_NY - 1);
-        if(c > d->chroma_max[hb][yb]) d->chroma_max[hb][yb] = c;
-      }
-  }
-  cmsDeleteTransform(tr);
-  d->lut_valid = TRUE;
-  d->lut_profile_type = d->params.gamut_profile_type;
-  g_strlcpy(d->lut_profile, d->params.gamut_profile_filename, sizeof(d->lut_profile));
-}
-
-// Bilinear-ish lookup of the paper max chroma at (hue, Y). Returns 0 if no LUT.
-static inline float _gamut_cmax(const dt_iop_coloruniformityv2_data_t *d, const float hue, const float Y)
-{
-  if(!d->lut_valid) return 0.0f;
-  const int hb = CLAMP((int)(wrap_hue(hue) * CU2_LUT_NH), 0, CU2_LUT_NH - 1);
-  const int yb = CLAMP((int)(CLAMPF(Y, 0.0f, CU2_LUT_YMAX) / CU2_LUT_YMAX * CU2_LUT_NY), 0, CU2_LUT_NY - 1);
-  return d->chroma_max[hb][yb];
-}
-
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   piece->data = calloc(1, sizeof(dt_iop_coloruniformityv2_data_t));
@@ -277,12 +178,6 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1,
                    dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece) {
   dt_iop_coloruniformityv2_data_t *d = piece->data;
   d->params = *(dt_iop_coloruniformityv2_params_t *)p1;
-  // (Re)build the gamut LUT only when needed (compression active + profile changed)
-  if(d->params.gamut_amount > 0.0f
-     && (!d->lut_valid
-         || d->lut_profile_type != d->params.gamut_profile_type
-         || strcmp(d->lut_profile, d->params.gamut_profile_filename) != 0))
-    _build_gamut_lut(d);
 }
 
 // --- 3. CPU PROCESSING LOGIC (ENGINE V8) ---
@@ -430,8 +325,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
 
       // Passthrough if nothing configured
       if (p->strength_h == 0.f && p->strength_c == 0.f && p->strength_l == 0.f
-          && p->offset_h == 0.f && p->offset_c == 0.f && p->offset_l == 0.f
-          && p->gamut_amount == 0.f) {
+          && p->offset_h == 0.f && p->offset_c == 0.f && p->offset_l == 0.f) {
         for(int c = 0; c < 4; c++) out_ptr[c] = in_ptr[c];
         continue;
       }
@@ -589,27 +483,6 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
         log_Y_corr += p->offset_l * off_w;
       }
       float Y_corr = exp2f(log_Y_corr);
-
-      // --- Gamut compression: pull chroma overshooting the paper boundary back toward it.
-      // In-gamut (below threshold) is protected; the overshoot is soft-compressed toward
-      // the boundary. Approximate (this is scene-referred, before AgX) -- tune with the
-      // soft-proof gamut check. ---
-      if(p->gamut_amount > 0.0f && d->lut_valid)
-      {
-        const float h_final = wrap_hue(atan2f(dg_base, dr_base) / (2.0f * M_PI_F));
-        const float cmax = _gamut_cmax(d, h_final, Y_corr);
-        if(cmax > 1e-4f)
-        {
-          const float knee = p->gamut_threshold * cmax;
-          if(c_corr > knee)
-          {
-            const float range = fmaxf(cmax - knee, 1e-4f);
-            const float over = c_corr - knee;
-            const float target_c = knee + range * (over / (over + range)); // soft asymptote to cmax
-            c_corr += p->gamut_amount * (target_c - c_corr);
-          }
-        }
-      }
 
       // Yrg reconstruction
       float ratio = (c_base > 1e-5f) ? (c_corr / c_base) : 0.0f;
@@ -847,8 +720,6 @@ static void _slider_changed_cb(GtkWidget *widget, gpointer user_data) {
   else if (widget == g->offset_h) p->offset_h = val;
   else if (widget == g->offset_c) p->offset_c = val;
   else if (widget == g->offset_l) p->offset_l = val;
-  else if (widget == g->gamut_amount) p->gamut_amount = val;
-  else if (widget == g->gamut_threshold) p->gamut_threshold = val;
 
   dt_dev_add_history_item(self->dev, self, TRUE);
 }
@@ -886,57 +757,6 @@ static void _bypass_luma_toggled(GtkWidget *widget, gpointer user_data)
   dt_dev_add_history_item(self->dev, self, TRUE);
 }
 
-// Paper-profile combobox: pos 0 = "none" (DT_COLORSPACE_NONE, OOG off);
-// real profiles are at out_pos + 1.
-static void _gamut_profile_changed(GtkWidget *widget, gpointer user_data)
-{
-  if(darktable.gui->reset) return;
-  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
-  dt_iop_coloruniformityv2_params_t *p = self->params;
-  const int pos = dt_bauhaus_combobox_get(widget);
-  if(pos <= 0)
-  {
-    p->gamut_profile_type = DT_COLORSPACE_NONE;
-    p->gamut_profile_filename[0] = '\0';
-    dt_dev_add_history_item(self->dev, self, TRUE);
-    return;
-  }
-  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
-  {
-    dt_colorspaces_color_profile_t *pp = l->data;
-    if(pp->out_pos == pos - 1)
-    {
-      p->gamut_profile_type = pp->type;
-      dt_strlcpy_to_fixed(p->gamut_profile_filename, pp->filename, sizeof(p->gamut_profile_filename));
-      dt_dev_add_history_item(self->dev, self, TRUE);
-      return;
-    }
-  }
-}
-
-// Convenience: pick, in the combobox above, whatever profile is currently the
-// global soft-proof. Same profile list (both come from color/out), so it maps
-// directly. Selecting the combobox fires _gamut_profile_changed (params + history).
-static void _gamut_use_softproof_clicked(GtkWidget *widget, gpointer user_data)
-{
-  if(darktable.gui->reset) return;
-  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
-  dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
-  const dt_colorspaces_color_profile_type_t sp_type = darktable.color_profiles->softproof_type;
-  const char *sp_file = darktable.color_profiles->softproof_filename;
-  int pos = 0; // fallback: "none" if the soft-proof profile is not output-eligible
-  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
-  {
-    dt_colorspaces_color_profile_t *pp = l->data;
-    if(pp->out_pos > -1 && pp->type == sp_type && !strcmp(pp->filename, sp_file))
-    {
-      pos = pp->out_pos + 1;
-      break;
-    }
-  }
-  dt_bauhaus_combobox_set(g->gamut_profile, pos);
-}
-
 void gui_update(dt_iop_module_t *self) {
   dt_iop_coloruniformityv2_gui_data_t *g = self->gui_data;
   dt_iop_coloruniformityv2_params_t *p = self->params;
@@ -966,25 +786,6 @@ void gui_update(dt_iop_module_t *self) {
   dt_bauhaus_slider_set(g->offset_h, p->offset_h);
   dt_bauhaus_slider_set(g->offset_c, p->offset_c);
   dt_bauhaus_slider_set(g->offset_l, p->offset_l);
-  dt_bauhaus_slider_set(g->gamut_amount, p->gamut_amount);
-  dt_bauhaus_slider_set(g->gamut_threshold, p->gamut_threshold);
-  // Paper profile combobox (pos 0 = none; real profiles at out_pos + 1)
-  if(p->gamut_profile_type == DT_COLORSPACE_NONE)
-    dt_bauhaus_combobox_set(g->gamut_profile, 0);
-  else
-  {
-    dt_bauhaus_combobox_set(g->gamut_profile, 0);
-    for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
-    {
-      dt_colorspaces_color_profile_t *pp = l->data;
-      if(pp->out_pos > -1 && pp->type == p->gamut_profile_type
-         && !strcmp(pp->filename, p->gamut_profile_filename))
-      {
-        dt_bauhaus_combobox_set(g->gamut_profile, pp->out_pos + 1);
-        break;
-      }
-    }
-  }
   gtk_combo_box_set_active(GTK_COMBO_BOX(g->offsets_weighted_combo), p->offsets_weighted);
 
   // Bypass buttons
@@ -1250,50 +1051,6 @@ void gui_init(dt_iop_module_t *self)
   gtk_box_pack_start(GTK_BOX(offsets_box), g->offsets_weighted_combo, TRUE, TRUE, 0);
   gtk_widget_show_all(offsets_box);
   dt_gui_box_add(page_adj, offsets_box);
-
-  // =========================================================================
-  // TAB: GAMUT (compress out-of-gamut chroma toward the soft-proof paper boundary)
-  // =========================================================================
-  GtkWidget *page_gamut = dt_ui_notebook_page(g->notebook,
-                                              N_("gamut"),
-                                              _("compress out-of-gamut chroma to the soft-proof paper"));
-
-  dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("paper profile")));
-  g->gamut_profile = dt_bauhaus_combobox_new(self);
-  dt_bauhaus_widget_set_label(g->gamut_profile, NULL, N_("paper profile"));
-  dt_bauhaus_combobox_add(g->gamut_profile, _("none"));  // pos 0 -> DT_COLORSPACE_NONE, OOG off
-  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
-  {
-    dt_colorspaces_color_profile_t *prof = l->data;
-    if(prof->out_pos > -1) dt_bauhaus_combobox_add(g->gamut_profile, prof->name);
-  }
-  gtk_widget_set_tooltip_text(g->gamut_profile,
-    _("paper/output profile whose gamut is used as the compression target.\n"
-      "stored in the edit (independent of the global soft-proof), so the result\n"
-      "is reproducible and applied on export. 'none' disables compression."));
-  g_signal_connect(G_OBJECT(g->gamut_profile), "value-changed",
-                   G_CALLBACK(_gamut_profile_changed), (gpointer)self);
-  dt_gui_box_add(page_gamut, g->gamut_profile);
-
-  GtkWidget *sp_btn = gtk_button_new_with_label(_("use soft-proof profile"));
-  gtk_widget_set_tooltip_text(sp_btn,
-    _("copy the profile currently set as the global soft-proof into the selector above."));
-  g_signal_connect(G_OBJECT(sp_btn), "clicked", G_CALLBACK(_gamut_use_softproof_clicked), (gpointer)self);
-  dt_gui_box_add(page_gamut, sp_btn);
-
-  dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("gamut compression")));
-  g->gamut_amount = _create_manual_slider(self, _("compression"), 0.0f, 1.0f, 0.01f, 0.0f, 2, "%", 100.0f);
-  gtk_widget_set_tooltip_text(g->gamut_amount,
-    _("compress chroma that overshoots the selected paper gamut back toward\n"
-      "its boundary (in-gamut is protected). needs a paper profile set above.\n"
-      "this is scene-referred (before AgX): approximate -- tune with the gamut check on."));
-  dt_gui_box_add(page_gamut, g->gamut_amount);
-
-  g->gamut_threshold = _create_manual_slider(self, _("threshold"), 0.2f, 1.0f, 0.01f, 0.8f, 2, "%", 100.0f);
-  gtk_widget_set_tooltip_text(g->gamut_threshold,
-    _("fraction of the paper boundary where compression starts.\n"
-      "lower = a wider soft roll-off; 100%% = compress only what is beyond the boundary."));
-  dt_gui_box_add(page_gamut, g->gamut_threshold);
 }
 
 void gui_focus(dt_iop_module_t *self, gboolean in)
