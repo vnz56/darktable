@@ -25,11 +25,13 @@
 #endif
 
 #include "bauhaus/bauhaus.h"
+#include "common/colorspaces.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/chromatic_adaptation.h"
 #include "common/bspline.h"
 #include "common/gamut_mapping.h"
 #include "common/image.h"
+#include <lcms2.h>
 #include "common/dttypes.h"
 #include "common/opencl.h"
 #include "control/control.h"
@@ -63,7 +65,7 @@
 #define DT_GUI_CURVE_EDITOR_INSET DT_PIXEL_APPLY_DPI(1)
 
 
-DT_MODULE_INTROSPECTION(6, dt_iop_filmicrgb_params_t)
+DT_MODULE_INTROSPECTION(7, dt_iop_filmicrgb_params_t)
 
 /**
  * DOCUMENTATION
@@ -190,11 +192,19 @@ typedef struct dt_iop_filmicrgb_params_t
   gboolean custom_grey;                         // $DEFAULT: FALSE $DESCRIPTION: "use custom middle-gray values"
   int high_quality_reconstruction;       // $MIN: 0 $MAX: 10 $DEFAULT: 1 $DESCRIPTION: "iterations of high-quality reconstruction"
   dt_iop_filmic_noise_distribution_t noise_distribution; // $DEFAULT: DT_NOISE_GAUSSIAN $DESCRIPTION: "type of noise"
-  dt_iop_filmicrgb_curve_type_t shadows; // $DEFAULT: DT_FILMIC_CURVE_POLY_4 $DESCRIPTION: "contrast in shadows"
-  dt_iop_filmicrgb_curve_type_t highlights; // $DEFAULT: DT_FILMIC_CURVE_POLY_4 $DESCRIPTION: "contrast in highlights"
+  dt_iop_filmicrgb_curve_type_t shadows; // $DEFAULT: DT_FILMIC_CURVE_POLY_3 $DESCRIPTION: "contrast in shadows"
+  dt_iop_filmicrgb_curve_type_t highlights; // $DEFAULT: DT_FILMIC_CURVE_POLY_3 $DESCRIPTION: "contrast in highlights"
   gboolean compensate_icc_black; // $DEFAULT: FALSE $DESCRIPTION: "compensate output ICC profile black point"
   dt_iop_filmicrgb_spline_version_type_t spline_version; // $DEFAULT: DT_FILMIC_SPLINE_VERSION_V3 $DESCRIPTION: "spline handling"
   gboolean enable_highlight_reconstruction; // $DEFAULT: FALSE $DESCRIPTION: "enable highlight reconstruction"
+
+  // v7 -- paper-gamut compression + out-of-gamut diagnostic (ported from AgX).
+  // Paper profile owned by the edit; the "set black" button (Lmin) reads its black.
+  dt_colorspaces_color_profile_type_t gamut_profile_type; // $DEFAULT: DT_COLORSPACE_NONE $DESCRIPTION: "gamut paper profile"
+  char gamut_profile_filename[DT_IOP_COLOR_ICC_LEN];
+  float gamut_amount;    // $MIN: 0.f $MAX: 1.f $DEFAULT: 0.f $DESCRIPTION: "gamut compression"
+  float gamut_threshold; // $MIN: 0.2f $MAX: 1.f $DEFAULT: 0.8f $DESCRIPTION: "gamut threshold"
+  int diag_mode;         // $DEFAULT: 0 $DESCRIPTION: "out-of-gamut diagnostic"
 } dt_iop_filmicrgb_params_t;
 // clang-format on
 
@@ -256,6 +266,14 @@ typedef struct dt_iop_filmicrgb_gui_data_t
   GtkWidget *noise_level, *noise_distribution;
   GtkWidget *compensate_icc_black;
   GtkWidget *enable_highlight_reconstruction;
+  GtkWidget *gamut_profile;
+  GtkWidget *diag_toggle;
+  // scene histogram overlaid on the tone-curve graph (binned in the curve's log domain)
+  uint32_t histogram[256];
+  uint32_t histogram_max, histogram_cliplo, histogram_cliphi, histogram_total;
+  // log-domain params used to BIN the histogram; the draw must remap with the SAME
+  // ones (not the live params) or the histogram wobbles while a slider is dragged.
+  float hist_grey, hist_black, hist_DR;
   GtkNotebook *notebook;
   GtkDrawingArea *area;
   struct dt_iop_filmic_rgb_spline_t spline DT_ALIGNED_ARRAY;
@@ -280,6 +298,12 @@ typedef struct dt_iop_filmicrgb_gui_data_t
   PangoRectangle ink;
   GtkStyleContext *context;
 } dt_iop_filmicrgb_gui_data_t;
+
+// Paper-gamut boundary LUT dimensions (Yrg Ych) -- shared by compressor + diagnostic.
+#define FLM_GLUT_NH 72
+#define FLM_GLUT_NY 48
+#define FLM_GLUT_YMAX 1.1f
+#define FLM_GSAFETY 0.95f
 
 typedef struct dt_iop_filmicrgb_data_t
 {
@@ -306,6 +330,17 @@ typedef struct dt_iop_filmicrgb_data_t
   struct dt_iop_filmic_rgb_spline_t spline DT_ALIGNED_ARRAY;
   dt_noise_distribution_t noise_distribution;
   gboolean enable_highlight_reconstruction;
+
+  // Paper-gamut boundary in Yrg Ych (filmic's native colour space), used by BOTH
+  // the compressor and the OOG diagnostic -> same model, they agree by construction.
+  float gamut_chroma_max[FLM_GLUT_NH][FLM_GLUT_NY];
+  float gamut_ymin, gamut_ymax;   // paper luminance range (Yrg Y)
+  gboolean gamut_lut_valid;
+  dt_colorspaces_color_profile_type_t gamut_lut_profile_type;
+  char gamut_lut_profile[512];
+  float gamut_amount;
+  float gamut_threshold;
+  int diag_mode;
 } dt_iop_filmicrgb_data_t;
 
 
@@ -817,6 +852,24 @@ int legacy_params(dt_iop_module_t *self,
     *new_params = n;
     *new_params_size = sizeof(dt_iop_filmicrgb_params_v6_t);
     *new_version = 6;
+    return 0;
+  }
+
+  if(old_version == 6)
+  {
+    // v7 appends the paper-gamut compression + diagnostic params at the end.
+    dt_iop_filmicrgb_params_t *n =
+      (dt_iop_filmicrgb_params_t *)malloc(sizeof(dt_iop_filmicrgb_params_t));
+    memcpy(n, old_params, sizeof(dt_iop_filmicrgb_params_v6_t));
+    // DT_COLORSPACE_NONE is -1, so set it explicitly (calloc/zero would give 0).
+    n->gamut_profile_type = DT_COLORSPACE_NONE;
+    n->gamut_profile_filename[0] = '\0';
+    n->gamut_amount = 0.f;      // off -> no behaviour change for existing edits
+    n->gamut_threshold = 0.8f;
+    n->diag_mode = 0;
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_filmicrgb_params_t);
+    *new_version = 7;
     return 0;
   }
   return 1;
@@ -2080,6 +2133,203 @@ void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   return;
 }
 
+// ============================================================================
+// Paper-gamut compression + out-of-gamut diagnostic (ported from AgX). Applied
+// as a post-pass on filmic's final output (pipe working RGB). The compression
+// pulls chroma overshooting the paper boundary back toward it (Yrg Ych); the
+// diagnostic overlay classifies OOG pixels as chroma vs luminance in dt UCS JCH.
+// ============================================================================
+static inline float _flm_wrap_hue(float h) { h -= floorf(h); return h; }
+
+static inline void _flm_yrg_neutral(float *rn, float *gn)
+{
+  const dt_aligned_pixel_t d65_xyz = { 0.95047f, 1.f, 1.08883f, 0.f };
+  dt_aligned_pixel_t d65_lms, d65_yrg;
+  dt_apply_transposed_color_matrix(d65_xyz, XYZ_D65_to_LMS_2006_D65_trans, d65_lms);
+  LMS_to_Yrg(d65_lms, d65_yrg);
+  *rn = d65_yrg[1];
+  *gn = d65_yrg[2];
+}
+
+static void _flm_lab_to_ych(const cmsCIELab *lab, const float rn, const float gn,
+                            float *Yout, float *cout, float *hout)
+{
+  cmsCIEXYZ xyz;
+  cmsLab2XYZ(cmsD50_XYZ(), &xyz, lab);
+  dt_aligned_pixel_t xyz50 = { (float)xyz.X, (float)xyz.Y, (float)xyz.Z, 0.f }, xyz65, plms, pyrg;
+  XYZ_D50_to_D65(xyz50, xyz65);
+  dt_apply_transposed_color_matrix(xyz65, XYZ_D65_to_LMS_2006_D65_trans, plms);
+  LMS_to_Yrg(plms, pyrg);
+  *Yout = pyrg[0];
+  const float dr = pyrg[1] - rn, dg = pyrg[2] - gn;
+  *cout = sqrtf(dr * dr + dg * dg);
+  *hout = _flm_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
+}
+
+static void _flm_build_gamut_lut(dt_iop_filmicrgb_data_t *d,
+                                 const dt_colorspaces_color_profile_type_t type,
+                                 const char *filename)
+{
+  d->gamut_lut_valid = FALSE;
+  memset(d->gamut_chroma_max, 0, sizeof(d->gamut_chroma_max));
+  d->gamut_ymin = 1e9f;
+  d->gamut_ymax = -1e9f;
+  const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
+      type, filename,
+      DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
+  if(!prof || !prof->profile) return;
+  cmsHPROFILE lab = cmsCreateLab4Profile(NULL);
+  cmsHTRANSFORM tr = cmsCreateTransform(prof->profile, TYPE_RGB_DBL, lab, TYPE_Lab_DBL,
+                                        INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_NOCACHE);
+  cmsCloseProfile(lab);
+  if(!tr) return;
+  float rn, gn;
+  _flm_yrg_neutral(&rn, &gn);
+  const int N = 48;
+  for(int face = 0; face < 6; face++)
+  {
+    const int fixed = face / 2;
+    const double fv = (face % 2) ? 1.0 : 0.0;
+    for(int i = 0; i <= N; i++)
+      for(int j = 0; j <= N; j++)
+      {
+        const double u = (double)i / N, w = (double)j / N;
+        double rgb[3];
+        if(fixed == 0) { rgb[0] = fv; rgb[1] = u; rgb[2] = w; }
+        else if(fixed == 1) { rgb[0] = u; rgb[1] = fv; rgb[2] = w; }
+        else { rgb[0] = u; rgb[1] = w; rgb[2] = fv; }
+        cmsCIELab l;
+        cmsDoTransform(tr, rgb, &l, 1);
+        float Y, c, h;
+        _flm_lab_to_ych(&l, rn, gn, &Y, &c, &h);
+        if(Y < d->gamut_ymin) d->gamut_ymin = Y;
+        if(Y > d->gamut_ymax) d->gamut_ymax = Y;
+        int hb = (int)(h * FLM_GLUT_NH); hb = CLAMP(hb, 0, FLM_GLUT_NH - 1);
+        int yb = (int)(Y / FLM_GLUT_YMAX * FLM_GLUT_NY); yb = CLAMP(yb, 0, FLM_GLUT_NY - 1);
+        if(c > d->gamut_chroma_max[hb][yb]) d->gamut_chroma_max[hb][yb] = c;
+      }
+  }
+  cmsDeleteTransform(tr);
+  d->gamut_lut_valid = TRUE;
+  d->gamut_lut_profile_type = type;
+  g_strlcpy(d->gamut_lut_profile, filename, sizeof(d->gamut_lut_profile));
+}
+
+static inline float _flm_gamut_cmax(const dt_iop_filmicrgb_data_t *d, const float hue, const float Y)
+{
+  if(!d->gamut_lut_valid) return 0.f;
+  const float hf = _flm_wrap_hue(hue) * FLM_GLUT_NH;
+  const float yf = CLAMPF(Y, 0.f, FLM_GLUT_YMAX) / FLM_GLUT_YMAX * (FLM_GLUT_NY - 1);
+  int h0 = (int)hf; const float ht = hf - h0;
+  const int h1 = (h0 + 1) % FLM_GLUT_NH; h0 = h0 % FLM_GLUT_NH;
+  int y0 = CLAMP((int)yf, 0, FLM_GLUT_NY - 1); const float yt = yf - y0;
+  const int y1 = MIN(y0 + 1, FLM_GLUT_NY - 1);
+  const float c00 = d->gamut_chroma_max[h0][y0], c01 = d->gamut_chroma_max[h0][y1];
+  const float c10 = d->gamut_chroma_max[h1][y0], c11 = d->gamut_chroma_max[h1][y1];
+  const float c0 = c00 + (c01 - c00) * yt, c1 = c10 + (c11 - c10) * yt;
+  return c0 + (c1 - c0) * ht;
+}
+
+static inline void _flm_apply_gamut(float *const restrict rgb,
+                                    const dt_iop_filmicrgb_data_t *const d,
+                                    const float amount, const float threshold,
+                                    const float rn, const float gn,
+                                    const dt_colormatrix_t work_in_T,
+                                    const dt_colormatrix_t work_out_T)
+{
+  const dt_aligned_pixel_t rgb4 = { rgb[0], rgb[1], rgb[2], 0.f };
+  dt_aligned_pixel_t xyz50, xyz65, lms, yrg;
+  dt_apply_transposed_color_matrix(rgb4, work_in_T, xyz50);
+  XYZ_D50_to_D65(xyz50, xyz65);
+  dt_apply_transposed_color_matrix(xyz65, XYZ_D65_to_LMS_2006_D65_trans, lms);
+  LMS_to_Yrg(lms, yrg);
+  const float Y = yrg[0];
+  const float dr = yrg[1] - rn, dg = yrg[2] - gn;
+  const float c = sqrtf(dr * dr + dg * dg);
+  if(c <= 1e-5f) return;
+  const float h = _flm_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
+  const float cmax = _flm_gamut_cmax(d, h, Y);
+  if(cmax <= 1e-4f) return;
+  const float sc = FLM_GSAFETY * cmax;
+  const float knee = threshold * sc;
+  if(c <= knee) return;
+  const float range = fmaxf(sc - knee, 1e-4f);
+  const float over = c - knee;
+  const float target_c = knee + range * (over / (over + range));
+  const float c_new = c + amount * (target_c - c);
+  const float ratio = c_new / c;
+  yrg[1] = rn + dr * ratio;
+  yrg[2] = gn + dg * ratio;
+  dt_aligned_pixel_t lms2, xyz65b, xyz50b, rgbout;
+  Yrg_to_LMS(yrg, lms2);
+  dt_apply_transposed_color_matrix(lms2, LMS_2006_D65_to_XYZ_D65_trans, xyz65b);
+  XYZ_D65_to_D50(xyz65b, xyz50b);
+  dt_apply_transposed_color_matrix(xyz50b, work_out_T, rgbout);
+  rgb[0] = rgbout[0];
+  rgb[1] = rgbout[1];
+  rgb[2] = rgbout[2];
+}
+
+// working-space RGB -> Yrg Ych (Y, chroma c, hue h in [0,1)). Same space as the
+// compressor and as filmic itself -> the diagnostic agrees with the compression.
+static inline void _flm_rgb_to_ych(const dt_aligned_pixel_t rgb, const dt_colormatrix_t work_in_T,
+                                   const float rn, const float gn, float *Y, float *c, float *h)
+{
+  dt_aligned_pixel_t xyz50, xyz65, lms, yrg;
+  dt_apply_transposed_color_matrix(rgb, work_in_T, xyz50);
+  XYZ_D50_to_D65(xyz50, xyz65);
+  dt_apply_transposed_color_matrix(xyz65, XYZ_D65_to_LMS_2006_D65_trans, lms);
+  LMS_to_Yrg(lms, yrg);
+  *Y = yrg[0];
+  const float dr = yrg[1] - rn, dg = yrg[2] - gn;
+  *c = sqrtf(dr * dr + dg * dg);
+  *h = _flm_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
+}
+
+// Scene histogram for the tone-curve graph: bin the input luminance in the SAME
+// log domain as the curve's X axis (log_tonemapping_v2_1ch), so it aligns exactly.
+// Computed on the preview pipe. cliplo/cliphi = pixels below black / above white EV.
+static void filmic_compute_histogram(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
+                                     const void *const ivoid, const dt_iop_roi_t *const roi_in)
+{
+  dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
+  if(!g) return;
+  if(!(piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW)) return;
+  const dt_iop_filmicrgb_data_t *const data = piece->data;
+  const size_t ch = piece->colors;
+  const size_t npix = (size_t)roi_in->width * roi_in->height;
+  const float *buf = (const float *)ivoid;
+  uint32_t hist[256];
+  memset(hist, 0, sizeof(hist));
+  uint32_t cliplo = 0, cliphi = 0, total = 0;
+  const size_t step = (npix > 500000) ? 4 : 1;
+  for(size_t k = 0; k < npix; k += step)
+  {
+    const float *px = buf + ch * k;
+    if(!isfinite(px[0]) || !isfinite(px[1]) || !isfinite(px[2])) continue;
+    const float Y = fmaxf(0.2126f * fmaxf(px[0], 0.f) + 0.7152f * fmaxf(px[1], 0.f)
+                          + 0.0722f * fmaxf(px[2], 0.f), NORM_MIN);
+    total++;
+    const float xnorm = log_tonemapping_v2_1ch(Y, data->grey_source, data->black_source,
+                                               data->dynamic_range);
+    if(xnorm <= 0.f)      cliplo++;
+    else if(xnorm >= 1.f) cliphi++;
+    else                  hist[CLAMP((int)(xnorm * 255.f), 0, 255)]++;
+  }
+  uint32_t hmax = 1;
+  for(int b = 0; b < 256; b++) if(hist[b] > hmax) hmax = hist[b];
+  memcpy(g->histogram, hist, sizeof(hist));
+  g->histogram_max = hmax;
+  g->histogram_cliplo = cliplo;
+  g->histogram_cliphi = cliphi;
+  g->histogram_total = total;
+  // remember the exact params the bins were computed with, for a consistent draw
+  g->hist_grey = data->grey_source;
+  g->hist_black = data->black_source;
+  g->hist_DR = data->dynamic_range;
+  if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+}
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const restrict ivoid,
@@ -2217,6 +2467,41 @@ void process(dt_iop_module_t *self,
                          data->version, black_display, white_display);
     }
   }
+
+  // Paper-gamut compression + OOG diagnostic, post-pass on filmic's working-RGB
+  // output. Both work in Yrg Ych against the SAME boundary LUT -> the diagnostic
+  // agrees with the compression by construction (100% compression clears it).
+  {
+    const gboolean do_gamut = data->gamut_amount > 0.f && data->gamut_lut_valid;
+    const gboolean do_diag = data->diag_mode > 0 && data->gamut_lut_valid && dt_pipe_is_full(piece->pipe);
+    if((do_gamut || do_diag) && work_profile)
+    {
+      const size_t npix = (size_t)roi_out->width * roi_out->height;
+      float rn = 0.f, gn = 0.f;
+      _flm_yrg_neutral(&rn, &gn);
+      DT_OMP_FOR()
+      for(size_t k = 0; k < npix * 4; k += 4)
+      {
+        float *const restrict pix = out + k;
+        if(do_gamut)
+          _flm_apply_gamut(pix, data, data->gamut_amount, data->gamut_threshold, rn, gn,
+                           work_profile->matrix_in_transposed, work_profile->matrix_out_transposed);
+        if(do_diag)
+        {
+          float Y, c, h;
+          _flm_rgb_to_ych(pix, work_profile->matrix_in_transposed, rn, gn, &Y, &c, &h);
+          // Relative (proportional) tolerance: the paper black (gamut_ymin) is itself
+          // tiny (~0.005), so an absolute band would swallow the whole sub-Lmin range.
+          if(Y < data->gamut_ymin * 0.98f || Y > data->gamut_ymax * 1.02f)
+          { pix[0] = 1.0f; pix[1] = 0.4f; pix[2] = 0.0f; } // luminance-OOG: orange
+          else if(c > _flm_gamut_cmax(data, h, Y))
+          { pix[0] = 1.0f; pix[1] = 0.0f; pix[2] = 1.0f; } // chroma-OOG: magenta
+        }
+      }
+    }
+  }
+
+  filmic_compute_histogram(self, piece, ivoid, roi_in);
 
   dt_free_align(reconstructed);
 }
@@ -2358,6 +2643,11 @@ int process_cl(dt_iop_module_t *self,
 {
   const dt_iop_filmicrgb_data_t *const d = piece->data;
   const dt_iop_filmicrgb_global_data_t *const gd = self->global_data;
+
+  // The paper-gamut compression and OOG diagnostic are CPU-only: fall back to CPU
+  // for this module when either is active.
+  if((d->gamut_amount > 0.f || d->diag_mode > 0) && d->gamut_lut_valid)
+    return DT_OPENCL_PROCESS_CL;
 
   cl_int err = DT_OPENCL_DEFAULT_ERROR;
 
@@ -3099,6 +3389,18 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->reconstruct_grey_vs_color = (p->reconstruct_grey_vs_color / 100.0f + 1.f) / 2.f;
 
   d->enable_highlight_reconstruction = p->enable_highlight_reconstruction;
+
+  // Paper-gamut compression + OOG diagnostic: copy live params and (re)build the
+  // single Yrg boundary LUT (shared by both) when either is active and the profile
+  // changed.
+  d->gamut_amount = p->gamut_amount;
+  d->gamut_threshold = p->gamut_threshold;
+  d->diag_mode = p->diag_mode;
+  if((p->gamut_amount > 0.f || p->diag_mode > 0)
+     && (!d->gamut_lut_valid
+         || d->gamut_lut_profile_type != p->gamut_profile_type
+         || strcmp(d->gamut_lut_profile, p->gamut_profile_filename) != 0))
+    _flm_build_gamut_lut(d, p->gamut_profile_type, p->gamut_profile_filename);
 }
 
 void gui_focus(dt_iop_module_t *self, gboolean in)
@@ -3144,6 +3446,21 @@ void gui_update(dt_iop_module_t *self)
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->auto_hardness), p->auto_hardness);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->custom_grey), p->custom_grey);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->enable_highlight_reconstruction), p->enable_highlight_reconstruction);
+
+  // gamut: diagnostic toggle + paper-profile combobox (pos 0 = none; real profiles at out_pos + 1)
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->diag_toggle), p->diag_mode > 0);
+  dt_bauhaus_combobox_set(g->gamut_profile, 0);
+  if(p->gamut_profile_type != DT_COLORSPACE_NONE)
+    for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+    {
+      dt_colorspaces_color_profile_t *pp = l->data;
+      if(pp->out_pos > -1 && pp->type == p->gamut_profile_type
+         && !strcmp(pp->filename, p->gamut_profile_filename))
+      {
+        dt_bauhaus_combobox_set(g->gamut_profile, pp->out_pos + 1);
+        break;
+      }
+    }
 
   gui_changed(self, NULL, NULL);
 }
@@ -3482,6 +3799,68 @@ static gboolean dt_iop_tonecurve_draw(GtkWidget *widget, cairo_t *crf, dt_iop_mo
     cairo_move_to(cr, 0, g->graph_height);
     cairo_line_to(cr, g->graph_width, 0);
     cairo_stroke(cr);
+
+    // --- Scene histogram behind the curve ---
+    // Bins live in the curve's log domain [0,1]; remap each to the current mode's
+    // X axis (identity for LOOK, exp_tonemapping for lin, log-scaled for log) so it
+    // stays aligned with the curve. Adaptive bar width handles the non-uniform mapping.
+    if(g->histogram_max > 0 && g->histogram_total > 0)
+    {
+      cairo_save(cr);
+      cairo_rectangle(cr, 0, 0, g->graph_width, g->graph_height);
+      cairo_clip(cr);
+      cairo_set_source_rgba(cr, 0.50, 0.60, 0.75, 0.45);
+      for(int b = 0; b < 256; b++)
+      {
+        const float hnl = (float)g->histogram[b] / (float)g->histogram_max;
+        if(hnl <= 0.f) continue;
+        const float hn = log10f(1.f + 9.f * hnl); // log compression: [0,1]->[0,1]
+        // remap the bins with the SAME log params they were binned with (g->hist_*),
+        // not the live params, so the histogram never wobbles during a slider drag.
+        float x0 = (float)b / 255.f, x1 = (float)(b + 1) / 255.f;
+        if(g->gui_mode == DT_FILMIC_GUI_BASECURVE)
+        {
+          x0 = exp_tonemapping_v2(x0, g->hist_grey, g->hist_black, g->hist_DR);
+          x1 = exp_tonemapping_v2(x1, g->hist_grey, g->hist_black, g->hist_DR);
+        }
+        else if(g->gui_mode == DT_FILMIC_GUI_BASECURVE_LOG)
+        {
+          x0 = dt_log_scale_axis(exp_tonemapping_v2(x0, g->hist_grey, g->hist_black, g->hist_DR), LOGBASE);
+          x1 = dt_log_scale_axis(exp_tonemapping_v2(x1, g->hist_grey, g->hist_black, g->hist_DR), LOGBASE);
+        }
+        const float px0 = x0 * g->graph_width;
+        const float w = fmaxf(x1 * g->graph_width - px0, 1.f);
+        cairo_rectangle(cr, px0, g->graph_height * (1.f - hn), w, hn * g->graph_height);
+        cairo_fill(cr);
+      }
+
+      // clipping indicators: below black EV (bottom-left) / above white EV (bottom-right)
+      const float pctlo = (float)g->histogram_cliplo / (float)g->histogram_total;
+      const float pcthi = (float)g->histogram_cliphi / (float)g->histogram_total;
+      const float trih = g->graph_height * 0.22f;
+      const float triw = DT_PIXEL_APPLY_DPI(12.f);
+      if(pctlo > 0.001f)
+      {
+        const float hh = trih * fminf(1.f, 0.3f + pctlo * 7.f);
+        cairo_set_source_rgba(cr, 0.9, 0.2, 0.15, fminf(0.9f, 0.3f + pctlo * 6.f));
+        cairo_move_to(cr, 0.f, g->graph_height);
+        cairo_line_to(cr, triw, g->graph_height);
+        cairo_line_to(cr, 0.f, g->graph_height - hh);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+      }
+      if(pcthi > 0.001f)
+      {
+        const float hh = trih * fminf(1.f, 0.3f + pcthi * 7.f);
+        cairo_set_source_rgba(cr, 0.9, 0.2, 0.15, fminf(0.9f, 0.3f + pcthi * 6.f));
+        cairo_move_to(cr, g->graph_width, g->graph_height);
+        cairo_line_to(cr, g->graph_width - triw, g->graph_height);
+        cairo_line_to(cr, g->graph_width, g->graph_height - hh);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+      }
+      cairo_restore(cr);
+    }
 
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(2.));
 
@@ -4335,6 +4714,158 @@ static gboolean area_motion_notify(GtkWidget *widget, const GdkEventMotion *even
   }
 }
 
+// Paper-profile combobox for the gamut page: pos 0 = "none"; real profiles at out_pos + 1.
+static void _flm_gamut_profile_changed(GtkWidget *widget, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_filmicrgb_params_t *p = self->params;
+  const int pos = dt_bauhaus_combobox_get(widget);
+  if(pos <= 0)
+  {
+    p->gamut_profile_type = DT_COLORSPACE_NONE;
+    p->gamut_profile_filename[0] = '\0';
+    dt_dev_add_history_item(darktable.develop, self, TRUE);
+    return;
+  }
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *pp = l->data;
+    if(pp->out_pos == pos - 1)
+    {
+      p->gamut_profile_type = pp->type;
+      g_strlcpy(p->gamut_profile_filename, pp->filename, sizeof(p->gamut_profile_filename));
+      dt_dev_add_history_item(darktable.develop, self, TRUE);
+      return;
+    }
+  }
+}
+
+static void _flm_gamut_use_softproof(GtkWidget *widget, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
+  const dt_colorspaces_color_profile_type_t sp_type = darktable.color_profiles->softproof_type;
+  const char *sp_file = darktable.color_profiles->softproof_filename;
+  int pos = 0;
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *pp = l->data;
+    if(pp->out_pos > -1 && pp->type == sp_type && !strcmp(pp->filename, sp_file))
+    {
+      pos = pp->out_pos + 1;
+      break;
+    }
+  }
+  dt_bauhaus_combobox_set(g->gamut_profile, pos);
+}
+
+static void _flm_diag_toggled(GtkWidget *w, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_filmicrgb_params_t *p = self->params;
+  p->diag_mode = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)) ? 1 : 0;
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+// "Lmin" button: read the black point of the module's paper profile (the combobox
+// above, NOT the global soft-proof) and bake it into black_point_target (in %).
+// filmic explicitly supports this use (see the compensate_icc_black comment).
+static void _flm_set_black(GtkWidget *w, dt_iop_module_t *self)
+{
+  dt_iop_filmicrgb_params_t *p = self->params;
+  const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
+      p->gamut_profile_type, p->gamut_profile_filename,
+      DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
+  if(!prof || !prof->profile)
+  {
+    dt_control_log(_("filmic: no paper profile is set in the gamut tab"));
+    return;
+  }
+  cmsCIEXYZ black = { 0.0, 0.0, 0.0 };
+  gboolean ok = cmsDetectDestinationBlackPoint(&black, prof->profile, INTENT_RELATIVE_COLORIMETRIC, 0);
+  if(!ok)
+  {
+    cmsCIEXYZ *tag = cmsReadTag(prof->profile, cmsSigMediaBlackPointTag);
+    if(tag) { black = *tag; ok = TRUE; }
+  }
+  if(!ok)
+  {
+    dt_control_log(_("filmic: could not read the paper black point"));
+    return;
+  }
+  // black_point_target is the target black luminance in %; black.Y is a 0..1 fraction.
+  const float y = CLAMPF((float)black.Y * 100.0f, 0.0f, 20.0f);
+  p->black_point_target = y;
+  dt_iop_gui_update(self);
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+  dt_control_log(_("filmic target black set to %.3f%% from the paper profile"), y);
+}
+
+static void _flm_create_gamut_page(dt_iop_module_t *self, dt_iop_filmicrgb_gui_data_t *g)
+{
+  self->widget = dt_ui_notebook_page(g->notebook, N_("gamut"), NULL);
+
+  dt_gui_box_add(self->widget, dt_ui_section_label_new(_("paper profile")));
+  g->gamut_profile = dt_bauhaus_combobox_new(self);
+  dt_bauhaus_widget_set_label(g->gamut_profile, NULL, N_("paper profile"));
+  dt_bauhaus_combobox_add(g->gamut_profile, _("none"));
+  for(GList *l = darktable.color_profiles->profiles; l; l = g_list_next(l))
+  {
+    dt_colorspaces_color_profile_t *prof = l->data;
+    if(prof->out_pos > -1) dt_bauhaus_combobox_add(g->gamut_profile, prof->name);
+  }
+  gtk_widget_set_tooltip_text(g->gamut_profile,
+    _("paper profile used by the gamut compression, the OOG diagnostic and the\n"
+      "'set black' button. stored in the edit -> reproducible and applied on export."));
+  g_signal_connect(G_OBJECT(g->gamut_profile), "value-changed",
+                   G_CALLBACK(_flm_gamut_profile_changed), self);
+  dt_gui_box_add(self->widget, g->gamut_profile);
+
+  GtkWidget *sp_btn = gtk_button_new_with_label(_("use soft-proof profile"));
+  gtk_widget_set_tooltip_text(sp_btn, _("copy the global soft-proof profile into the selector above."));
+  g_signal_connect(G_OBJECT(sp_btn), "clicked", G_CALLBACK(_flm_gamut_use_softproof), self);
+  dt_gui_box_add(self->widget, sp_btn);
+
+  GtkWidget *blk_btn = gtk_button_new_with_label(_("set black from paper profile"));
+  gtk_widget_set_tooltip_text(blk_btn,
+    _("set 'target black luminance' (display tab) to the paper black (Lmin) of the\n"
+      "profile selected above, so shadows are not crushed below the paper black."));
+  g_signal_connect(G_OBJECT(blk_btn), "clicked", G_CALLBACK(_flm_set_black), self);
+  dt_gui_box_add(self->widget, blk_btn);
+
+  dt_gui_box_add(self->widget, dt_ui_section_label_new(_("gamut compression")));
+  GtkWidget *sl = dt_bauhaus_slider_from_params(self, "gamut_amount");
+  dt_bauhaus_slider_set_format(sl, "%");
+  dt_bauhaus_slider_set_factor(sl, 100.f);
+  gtk_widget_set_tooltip_text(sl,
+    _("compress chroma overshooting the paper gamut back toward its boundary\n"
+      "(in-gamut protected). applied as the last step of filmic. needs a paper profile.\n"
+      "\n"
+      "⚠ assumes a well-behaved (monotonic) tone curve. with 'hard' contrast\n"
+      "(options tab) the toe/shoulder can overshoot and manufacture artefact\n"
+      "out-of-gamut colours, making this compression fight a curve problem rather\n"
+      "than a real paper one. use 'soft' or 'safe' contrast for reliable results."));
+  sl = dt_bauhaus_slider_from_params(self, "gamut_threshold");
+  dt_bauhaus_slider_set_format(sl, "%");
+  dt_bauhaus_slider_set_factor(sl, 100.f);
+  gtk_widget_set_tooltip_text(sl,
+    _("fraction of the paper boundary where compression starts.\n"
+      "lower = a wider soft roll-off; 100% = compress only what is beyond the boundary."));
+
+  dt_gui_box_add(self->widget, dt_ui_section_label_new(_("diagnostic")));
+  g->diag_toggle = gtk_check_button_new_with_label(_("show out-of-gamut"));
+  gtk_widget_set_tooltip_text(g->diag_toggle,
+    _("overlay against the real paper ICC (Yrg Ych):\n"
+      "  magenta = out of gamut by chroma (desaturating brings it in)\n"
+      "  orange  = out of gamut by luminance (too light/dark for the paper)\n"
+      "darkroom view only -- never on the histogram or the export.\n"
+      "\n"
+      "⚠ meaningful only with a monotonic curve: 'hard' contrast (options tab) can\n"
+      "overshoot and flag artefact out-of-gamut -- prefer 'soft' or 'safe' contrast."));
+  g_signal_connect(G_OBJECT(g->diag_toggle), "toggled", G_CALLBACK(_flm_diag_toggled), self);
+  dt_gui_box_add(self->widget, g->diag_toggle);
+}
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_filmicrgb_gui_data_t *g = IOP_GUI_ALLOC(filmicrgb);
@@ -4622,6 +5153,8 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->noise_distribution,
                               _("choose the statistical distribution of noise.\n"
                                 "this is useful to match natural sensor noise pattern."));
+
+  _flm_create_gamut_page(self, g);
 
   // start building top level widget
   self->widget = dt_gui_vbox(g->area, g->notebook);
