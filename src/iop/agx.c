@@ -311,11 +311,6 @@ typedef struct primaries_params_t
 #define AGX_GAMUT_LUT_NH 72
 #define AGX_GAMUT_LUT_NY 48
 #define AGX_GAMUT_LUT_YMAX 1.1f
-// Diagnostic boundary in dt UCS JCH (perceptual). Finer grid than the compressor
-// LUT, because it is the "ruler": we want few false negatives.
-#define AGX_DIAG_LUT_NH 72
-#define AGX_DIAG_LUT_NJ 48
-#define AGX_DIAG_LUT_JMAX 1.15f
 // Compress toward a fraction of the measured boundary (the Yrg device-cube
 // boundary over-estimates the true ICC gamut) so results land safely inside.
 #define AGX_GAMUT_SAFETY 0.95f
@@ -323,21 +318,15 @@ typedef struct dt_iop_agx_data_t
 {
   tone_mapping_params_t tone_mapping_params;
   primaries_params_t primaries_params;
-  // paper-gamut boundary chroma_max(hue, Y) in Yrg Ych, built from the edit's
-  // paper profile in commit_params; used by the final display-referred compression.
+  // Paper-gamut boundary in Yrg Ych, used by BOTH the compressor and the OOG
+  // diagnostic (same model -> they agree by construction).
   float gamut_chroma_max[AGX_GAMUT_LUT_NH][AGX_GAMUT_LUT_NY];
+  float gamut_ymin, gamut_ymax;  // paper luminance range (Yrg Y)
   gboolean gamut_lut_valid;
   dt_colorspaces_color_profile_type_t gamut_lut_profile_type;
   char gamut_lut_profile[512];
   float gamut_amount;
   float gamut_threshold;
-  // Out-of-gamut diagnostic: paper boundary Cmax(hue, J) in dt UCS JCH (perceptual,
-  // hue-linear), built from the real paper ICC. Ground truth for the overlay.
-  float diag_cmax[AGX_DIAG_LUT_NH][AGX_DIAG_LUT_NJ];
-  float diag_jmin, diag_jmax;    // paper lightness range (dt UCS J)
-  gboolean diag_lut_valid;
-  dt_colorspaces_color_profile_type_t diag_lut_profile_type;
-  char diag_lut_profile[512];
   int diag_mode;
 } dt_iop_agx_data_t;
 
@@ -1542,6 +1531,8 @@ static void _agx_build_gamut_lut(dt_iop_agx_data_t *d,
 {
   d->gamut_lut_valid = FALSE;
   memset(d->gamut_chroma_max, 0, sizeof(d->gamut_chroma_max));
+  d->gamut_ymin = 1e9f;
+  d->gamut_ymax = -1e9f;
   const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
       type, filename,
       DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
@@ -1573,6 +1564,8 @@ static void _agx_build_gamut_lut(dt_iop_agx_data_t *d,
         cmsDoTransform(tr, rgb, &l, 1);
         float Y, c, h;
         _agx_lab_to_ych(&l, rn, gn, &Y, &c, &h);
+        if(Y < d->gamut_ymin) d->gamut_ymin = Y;
+        if(Y > d->gamut_ymax) d->gamut_ymax = Y;
         int hb = (int)(h * AGX_GAMUT_LUT_NH); hb = CLAMP(hb, 0, AGX_GAMUT_LUT_NH - 1);
         int yb = (int)(Y / AGX_GAMUT_LUT_YMAX * AGX_GAMUT_LUT_NY); yb = CLAMP(yb, 0, AGX_GAMUT_LUT_NY - 1);
         if(c > d->gamut_chroma_max[hb][yb]) d->gamut_chroma_max[hb][yb] = c;
@@ -1645,99 +1638,26 @@ static inline void _agx_apply_gamut(float *const restrict rgb,
 }
 
 // ============================================================================
-// Out-of-gamut diagnostic (the "ruler"): a paper boundary in dt UCS JCH built
-// from the real paper ICC, used to classify each pixel as in-gamut,
+// Out-of-gamut diagnostic (the "ruler"): reuses the compressor's Yrg Ych paper
+// boundary (same model -> they agree), used to classify each pixel as in-gamut,
 // out-of-gamut-by-chroma (reducible by desaturating), or out-of-gamut-by-
 // luminance (lightness beyond the paper range -- desaturating cannot fix it).
 // Visualisation only; painted on the full pipe, never on histogram/export.
 // ============================================================================
-static inline float _agx_jch_hue_norm(const float h_rad)
+// working-space RGB -> Yrg Ych (Y, chroma c, hue h in [0,1)). Same space as the
+// compressor and as filmic itself -> the diagnostic agrees with the compression.
+static inline void _agx_rgb_to_ych(const dt_aligned_pixel_t rgb, const dt_colormatrix_t work_in_T,
+                                   const float rn, const float gn, float *Y, float *c, float *h)
 {
-  float hn = h_rad / (2.f * M_PI_F);
-  hn -= floorf(hn);
-  return hn; // [0, 1)
-}
-
-// working-space RGB -> dt UCS JCH (perceptual). work_in_T: working RGB -> XYZ(D50).
-static inline void _agx_rgb_to_jch(const dt_aligned_pixel_t rgb, const dt_colormatrix_t work_in_T,
-                                   const float L_white, dt_aligned_pixel_t JCH)
-{
-  dt_aligned_pixel_t xyz50, xyz65, xyY;
+  dt_aligned_pixel_t xyz50, xyz65, lms, yrg;
   dt_apply_transposed_color_matrix(rgb, work_in_T, xyz50);
   XYZ_D50_to_D65(xyz50, xyz65);
-  dt_D65_XYZ_to_xyY(xyz65, xyY);
-  xyY_to_dt_UCS_JCH(xyY, L_white, JCH);
-}
-
-static void _agx_build_diag_lut(dt_iop_agx_data_t *d,
-                                const dt_colorspaces_color_profile_type_t type,
-                                const char *filename)
-{
-  d->diag_lut_valid = FALSE;
-  memset(d->diag_cmax, 0, sizeof(d->diag_cmax));
-  d->diag_jmin = 1e9f;
-  d->diag_jmax = -1e9f;
-  const dt_colorspaces_color_profile_t *prof = dt_colorspaces_get_profile(
-      type, filename,
-      DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY | DT_PROFILE_DIRECTION_DISPLAY2);
-  if(!prof || !prof->profile) return;
-
-  cmsHPROFILE lab = cmsCreateLab4Profile(NULL);
-  cmsHTRANSFORM tr = cmsCreateTransform(prof->profile, TYPE_RGB_DBL, lab, TYPE_Lab_DBL,
-                                        INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_NOCACHE);
-  cmsCloseProfile(lab);
-  if(!tr) return;
-
-  const float L_white = Y_to_dt_UCS_L_star(1.f);
-  const int N = 48; // device cube surface sampling (the gamut hull)
-  for(int face = 0; face < 6; face++)
-  {
-    const int fixed = face / 2;
-    const double fv = (face % 2) ? 1.0 : 0.0;
-    for(int i = 0; i <= N; i++)
-      for(int j = 0; j <= N; j++)
-      {
-        const double u = (double)i / N, w = (double)j / N;
-        double rgb[3];
-        if(fixed == 0) { rgb[0] = fv; rgb[1] = u; rgb[2] = w; }
-        else if(fixed == 1) { rgb[0] = u; rgb[1] = fv; rgb[2] = w; }
-        else { rgb[0] = u; rgb[1] = w; rgb[2] = fv; }
-        cmsCIELab l;
-        cmsDoTransform(tr, rgb, &l, 1);
-        cmsCIEXYZ xyz;
-        cmsLab2XYZ(cmsD50_XYZ(), &xyz, &l);
-        dt_aligned_pixel_t xyz50 = { (float)xyz.X, (float)xyz.Y, (float)xyz.Z, 0.f }, xyz65, xyY, JCH;
-        XYZ_D50_to_D65(xyz50, xyz65);
-        dt_D65_XYZ_to_xyY(xyz65, xyY);
-        xyY_to_dt_UCS_JCH(xyY, L_white, JCH);
-        const float J = JCH[0], C = JCH[1];
-        const float hn = _agx_jch_hue_norm(JCH[2]);
-        if(J < d->diag_jmin) d->diag_jmin = J;
-        if(J > d->diag_jmax) d->diag_jmax = J;
-        int hb = (int)(hn * AGX_DIAG_LUT_NH); hb = CLAMP(hb, 0, AGX_DIAG_LUT_NH - 1);
-        int jb = (int)(J / AGX_DIAG_LUT_JMAX * AGX_DIAG_LUT_NJ); jb = CLAMP(jb, 0, AGX_DIAG_LUT_NJ - 1);
-        if(C > d->diag_cmax[hb][jb]) d->diag_cmax[hb][jb] = C;
-      }
-  }
-  cmsDeleteTransform(tr);
-  d->diag_lut_valid = TRUE;
-  d->diag_lut_profile_type = type;
-  g_strlcpy(d->diag_lut_profile, filename, sizeof(d->diag_lut_profile));
-}
-
-// Bilinear lookup of paper max chroma at (hue in [0,1), J). Hue wraps.
-static inline float _agx_diag_cmax(const dt_iop_agx_data_t *d, const float hn, const float J)
-{
-  const float hf = hn * AGX_DIAG_LUT_NH;
-  const float jf = CLAMPF(J, 0.f, AGX_DIAG_LUT_JMAX) / AGX_DIAG_LUT_JMAX * (AGX_DIAG_LUT_NJ - 1);
-  int h0 = (int)hf; const float ht = hf - h0;
-  const int h1 = (h0 + 1) % AGX_DIAG_LUT_NH; h0 = h0 % AGX_DIAG_LUT_NH;
-  int j0 = CLAMP((int)jf, 0, AGX_DIAG_LUT_NJ - 1); const float jt = jf - j0;
-  const int j1 = MIN(j0 + 1, AGX_DIAG_LUT_NJ - 1);
-  const float c00 = d->diag_cmax[h0][j0], c01 = d->diag_cmax[h0][j1];
-  const float c10 = d->diag_cmax[h1][j0], c11 = d->diag_cmax[h1][j1];
-  const float c0 = c00 + (c01 - c00) * jt, c1 = c10 + (c11 - c10) * jt;
-  return c0 + (c1 - c0) * ht;
+  dt_apply_transposed_color_matrix(xyz65, XYZ_D65_to_LMS_2006_D65_trans, lms);
+  LMS_to_Yrg(lms, yrg);
+  *Y = yrg[0];
+  const float dr = yrg[1] - rn, dg = yrg[2] - gn;
+  *c = sqrtf(dr * dr + dg * dg);
+  *h = _agx_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
 }
 
 void process(dt_iop_module_t *self,
@@ -1791,12 +1711,11 @@ void process(dt_iop_module_t *self,
 
   // Final display-referred paper-gamut compression (after the look and the outset).
   const gboolean do_gamut = d->gamut_amount > 0.f && d->gamut_lut_valid;
-  float gamut_rn = 0.f, gamut_gn = 0.f;
-  if(do_gamut) _agx_yrg_neutral(&gamut_rn, &gamut_gn);
-
   // Out-of-gamut diagnostic overlay: full darkroom pipe only (never histogram/export).
-  const gboolean do_diag = d->diag_mode > 0 && d->diag_lut_valid && dt_pipe_is_full(piece->pipe);
-  const float diag_Lwhite = Y_to_dt_UCS_L_star(1.f);
+  // Uses the SAME Yrg boundary LUT as the compressor -> they agree by construction.
+  const gboolean do_diag = d->diag_mode > 0 && d->gamut_lut_valid && dt_pipe_is_full(piece->pipe);
+  float gamut_rn = 0.f, gamut_gn = 0.f;
+  if(do_gamut || do_diag) _agx_yrg_neutral(&gamut_rn, &gamut_gn);
 
   DT_OMP_FOR()
   for(size_t k = 0; k < 4 * n_pixels; k += 4)
@@ -1842,21 +1761,19 @@ void process(dt_iop_module_t *self,
                        pipe_work_profile->matrix_out_transposed);
 
     // Out-of-gamut diagnostic overlay, on the *final* output (so it shows what
-    // remains OOG after any compression). Classify against the paper boundary:
-    //   J out of [Jmin, Jmax]        -> luminance-OOG (desaturating cannot fix it)
-    //   J in range but C > Cmax(h,J) -> chroma-OOG    (desaturating fixes it)
+    // remains OOG after any compression). Same Yrg boundary as the compressor:
+    //   Y out of [Ymin, Ymax]        -> luminance-OOG (desaturating cannot fix it)
+    //   Y in range but c > Cmax(h,Y) -> chroma-OOG    (desaturating fixes it)
     if(do_diag)
     {
-      dt_aligned_pixel_t JCH;
-      _agx_rgb_to_jch(pix_out, pipe_work_profile->matrix_in_transposed, diag_Lwhite, JCH);
-      const float J = JCH[0], C = JCH[1];
-      const float hn = _agx_jch_hue_norm(JCH[2]);
-      const float jeps = 0.005f;
-      if(J < d->diag_jmin - jeps || J > d->diag_jmax + jeps)
+      float Y, c, h;
+      _agx_rgb_to_ych(pix_out, pipe_work_profile->matrix_in_transposed, gamut_rn, gamut_gn, &Y, &c, &h);
+      // relative tolerance (paper black Y is itself tiny -> an absolute band would swallow it)
+      if(Y < d->gamut_ymin * 0.98f || Y > d->gamut_ymax * 1.02f)
       {
         pix_out[0] = 1.0f; pix_out[1] = 0.4f; pix_out[2] = 0.0f; // luminance-OOG: orange
       }
-      else if(C > _agx_diag_cmax(d, hn, J))
+      else if(c > _agx_gamut_cmax(d, h, Y))
       {
         pix_out[0] = 1.0f; pix_out[1] = 0.0f; pix_out[2] = 1.0f; // chroma-OOG: magenta
       }
@@ -3388,7 +3305,7 @@ static void _create_gamut_page(dt_iop_module_t *main, dt_iop_agx_gui_data_t *g)
   dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("diagnostic")));
   g->diag_toggle = gtk_check_button_new_with_label(_("show out-of-gamut"));
   gtk_widget_set_tooltip_text(g->diag_toggle,
-    _("overlay, computed against the real paper ICC in a perceptual space (dt UCS):\n"
+    _("overlay against the real paper ICC (Yrg Ych, same model as the compressor):\n"
       "  magenta = out of gamut by chroma (desaturating brings it in)\n"
       "  orange  = out of gamut by luminance (too light/dark for the paper --\n"
       "            desaturating cannot fix it; needs a lightness change)\n"
@@ -3660,24 +3577,17 @@ void commit_params(dt_iop_module_t *self,
   processing_params->tone_mapping_params = _calculate_tone_mapping_params(p);
   processing_params->primaries_params = _get_primaries_params(p);
 
-  // Paper-gamut compression: copy live params, (re)build the LUT only when the
-  // compression is active and the paper profile changed.
+  // Paper-gamut compression + OOG diagnostic: copy live params and (re)build the
+  // single Yrg boundary LUT (shared by both) when either is active and the profile
+  // changed.
   processing_params->gamut_amount = p->gamut_amount;
   processing_params->gamut_threshold = p->gamut_threshold;
-  if(p->gamut_amount > 0.f
+  processing_params->diag_mode = p->diag_mode;
+  if((p->gamut_amount > 0.f || p->diag_mode > 0)
      && (!processing_params->gamut_lut_valid
          || processing_params->gamut_lut_profile_type != p->gamut_profile_type
          || strcmp(processing_params->gamut_lut_profile, p->gamut_profile_filename) != 0))
     _agx_build_gamut_lut(processing_params, p->gamut_profile_type, p->gamut_profile_filename);
-
-  // Out-of-gamut diagnostic: build the perceptual (dt UCS JCH) paper boundary from
-  // the same paper profile when the overlay is on and the profile changed.
-  processing_params->diag_mode = p->diag_mode;
-  if(p->diag_mode > 0
-     && (!processing_params->diag_lut_valid
-         || processing_params->diag_lut_profile_type != p->gamut_profile_type
-         || strcmp(processing_params->diag_lut_profile, p->gamut_profile_filename) != 0))
-    _agx_build_diag_lut(processing_params, p->gamut_profile_type, p->gamut_profile_filename);
 }
 
 void reload_defaults(dt_iop_module_t *self)
@@ -3737,7 +3647,7 @@ int process_cl(dt_iop_module_t *self,
 
   // The final paper-gamut compression and the OOG diagnostic overlay are CPU-only:
   // fall back to CPU for this module when either is active.
-  if((d->gamut_amount > 0.f && d->gamut_lut_valid) || (d->diag_mode > 0 && d->diag_lut_valid))
+  if((d->gamut_amount > 0.f || d->diag_mode > 0) && d->gamut_lut_valid)
     return DT_OPENCL_PROCESS_CL;
 
   cl_int err = CL_SUCCESS;
