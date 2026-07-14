@@ -179,6 +179,7 @@ typedef struct dt_iop_colorwarp_nodedata_t
 typedef struct dt_iop_colorwarp_data_t
 {
   int num_nodes;
+  int active_node;                                // which node the mask preview isolates
   dt_iop_colorwarp_nodedata_t nd[CW_MAX_NODES];   // resolved, process-ready nodes
   float smoothing;       // spatial mask smoothing amount [0,1] (global)
   float edge_eps;        // guided-filter sqrt_eps (edge sensitivity) (global)
@@ -320,7 +321,8 @@ void process(dt_iop_module_t *self,
   for(int n = 0; n < d->num_nodes; n++)
   {
     const dt_iop_colorwarp_nodedata_t *const nd = &d->nd[n];
-    if(nd->strength <= 0.f && mask_mode != 2) continue;   // inactive nodes still shown in the mask
+    if(mask_mode != 0 && n != d->active_node) continue;   // a mask preview isolates the active node
+    if(nd->strength <= 0.f && mask_mode != 2) continue;   // inactive nodes add no move (selection still shown)
 
     const float hc = nd->hc;
     const float inv_2sh2 = 1.0f / (2.0f * nd->sigma_h * nd->sigma_h);
@@ -515,6 +517,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   const int nn = CLAMP(p->num_nodes, 1, CW_MAX_NODES);
   const int act = CLAMP(p->active_node, 0, nn - 1);
   d->num_nodes = nn;
+  d->active_node = act;
   for(int i = 0; i < nn; i++)
     _cw_resolve_node((i == act) ? &scratch : &p->node[i], &d->nd[i]);
 
@@ -855,10 +858,11 @@ static gboolean _cw_press(GtkWidget *widget, GdkEventButton *e, dt_iop_module_t 
   double sa, sb, ta, tb, sx, sy, tx, ty;
   _cw_src_ab(g->mode, p, &sa, &sb); _cw_ab_pt(g->mode, sa, sb, cx, cy, R, &sx, &sy);
   _cw_tgt_ab(g->mode, p, &ta, &tb); _cw_ab_pt(g->mode, ta, tb, cx, cy, R, &tx, &ty);
-  const double eps = DT_PIXEL_APPLY_DPI(14.0);
-  if(hypot(e->x - tx, e->y - ty) < eps) g->drag = 2;
-  else if(hypot(e->x - sx, e->y - sy) < eps) g->drag = 1;
-  else { g->drag = 1; _cw_set_from_xy(self, e->x, e->y, 1); }   // click empty -> move source
+  const double eps = DT_PIXEL_APPLY_DPI(12.0);
+  g->drag = 0;
+  if(hypot(e->x - tx, e->y - ty) < eps) g->drag = 2;                 // grab target
+  else if(hypot(e->x - sx, e->y - sy) < eps) g->drag = 1;            // grab source
+  else { g->drag = 1; _cw_set_from_xy(self, e->x, e->y, 1); }        // click empty -> move source
   return TRUE;
 }
 
