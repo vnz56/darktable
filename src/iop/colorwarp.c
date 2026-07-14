@@ -65,6 +65,8 @@ typedef struct dt_iop_colorwarp_node_t
   float sat_range;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0
   float select_light;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
   float light_range;      // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0
+  float feather;          // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
+  float neutral_protect;  // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
   int invert;             // $DEFAULT: 0
   float shift_hue;        // $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0
   float shift_chroma;     // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
@@ -99,6 +101,8 @@ typedef struct dt_iop_colorwarp_params_t
   float sat_range;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0 $DESCRIPTION: "saturation range"
   float select_light;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5 $DESCRIPTION: "select lightness"
   float light_range;      // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0 $DESCRIPTION: "lightness range"
+  float feather;          // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5 $DESCRIPTION: "feather"
+  float neutral_protect;  // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "neutral protection"
   gboolean invert;        // $DEFAULT: FALSE $DESCRIPTION: "invert selection"
   // --- the H/S/L move applied to the selection ---
   float shift_hue;        // $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0 $DESCRIPTION: "shift hue"
@@ -135,6 +139,7 @@ typedef struct dt_iop_colorwarp_params_t
 typedef struct dt_iop_colorwarp_gui_data_t
 {
   GtkWidget *strength, *center_hue, *reach, *select_sat, *sat_range, *select_light, *light_range, *invert;
+  GtkWidget *feather, *neutral_protect;
   GtkWidget *shift_hue, *shift_chroma, *shift_lightness, *convergence, *affinity;
   GtkWidget *neutral_zone, *priority, *absolute_target, *smoothing, *edge;
   GtkNotebook *aff_notebook;   // affinity: global + per-component pages
@@ -156,11 +161,12 @@ typedef struct dt_iop_colorwarp_nodedata_t
 {
   float strength;
   float hc;              // selected hue centre (radians)
-  float sigma_h;         // hue-angular Gaussian width (radians)
+  float hw_h, sigma_h;   // hue plateau half-width + shoulder sigma (radians)
   float sat_center;      // selected saturation centre (dt UCS S)
-  float sat_sigma;       // saturation Gaussian half-width (large = all)
+  float hw_s, sat_sigma; // saturation plateau half-width + shoulder sigma
   float light_center;    // selected lightness centre (dt UCS J)
-  float light_sigma;     // lightness Gaussian half-width (large = all)
+  float hw_l, light_sigma; // lightness plateau half-width + shoulder sigma
+  float guard2;          // neutral-protection guard, squared (dt UCS S)
   int invert;            // invert the whole selection
   float sel_hue;         // selection centre hue (turns [0,1])
   float sel_sat;         // selection centre saturation (canvas [0,1])
@@ -228,6 +234,13 @@ const char **description(dt_iop_module_t *self)
 // neutral-zone slider [0,1] -> preserved-core radius (canvas-distance units), progressive
 // (fine control at the low end), spanning the 3D colour scope. Same idea as coloruniformity.
 #define CW_RMAX 1.5f
+// one selection axis: flat plateau of half-width hw, then a Gaussian shoulder.
+static inline float _cw_band_w(const float ad, const float hw, const float inv_2sig2)
+{
+  const float e = fmaxf(ad - hw, 0.0f);
+  return expf(-(e * e) * inv_2sig2);
+}
+
 static inline float _cw_neutral_radius(const float neutral)
 {
   const float n = CLAMP(neutral, 0.0f, 1.0f);
@@ -316,7 +329,6 @@ void process(dt_iop_module_t *self,
     if(sel_acc) sel_acc[k] = 0.0f;
   }
 
-  const float guard2 = 0.003f * 0.003f;
   const int gw = (int)(d->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
 
   // --- per node: build its mask, smooth it, accumulate its move (superposition field) ---
@@ -326,12 +338,13 @@ void process(dt_iop_module_t *self,
     if(mask_mode != 0 && !mask_all && n != d->active_node) continue;   // isolate active node, unless "all nodes"
     if(nd->strength <= 0.f && mask_mode != 2) continue;   // inactive nodes add no move (selection still shown)
 
-    const float hc = nd->hc;
+    const float hc = nd->hc, hw_h = nd->hw_h;
     const float inv_2sh2 = 1.0f / (2.0f * nd->sigma_h * nd->sigma_h);
-    const float sat_center = nd->sat_center;
+    const float sat_center = nd->sat_center, hw_s = nd->hw_s;
     const float inv_2ss2 = 1.0f / (2.0f * nd->sat_sigma * nd->sat_sigma);
-    const float light_center = nd->light_center;
+    const float light_center = nd->light_center, hw_l = nd->hw_l;
     const float inv_2sl2 = 1.0f / (2.0f * nd->light_sigma * nd->light_sigma);
+    const float guard2 = nd->guard2;
     const int invert = nd->invert;
 
     DT_OMP_FOR()
@@ -343,12 +356,10 @@ void process(dt_iop_module_t *self,
       dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
       const float J = JCH[0], C = JCH[1], h = JCH[2];
       const float sat = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
-      const float dh = atan2f(sinf(h - hc), cosf(h - hc));
-      const float hue_w = expf(-(dh * dh) * inv_2sh2);
-      const float ds = sat - sat_center;
-      const float sat_w = expf(-(ds * ds) * inv_2ss2);
-      const float dl = J - light_center;
-      const float light_w = expf(-(dl * dl) * inv_2sl2);
+      const float dh = fabsf(atan2f(sinf(h - hc), cosf(h - hc)));
+      const float hue_w = _cw_band_w(dh, hw_h, inv_2sh2);
+      const float sat_w = _cw_band_w(fabsf(sat - sat_center), hw_s, inv_2ss2);
+      const float light_w = _cw_band_w(fabsf(J - light_center), hw_l, inv_2sl2);
       float sel = hue_w * sat_w * light_w;
       if(invert) sel = 1.0f - sel;
       mask[k] = sel * (sat * sat) / (sat * sat + guard2);
@@ -470,11 +481,19 @@ static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_
 {
   nd->strength = n->strength;
   nd->hc = n->center_hue * (2.0f * M_PI_F) - M_PI_F;   // [0,1] -> [-pi,pi]
-  nd->sigma_h = fmaxf(n->reach * M_PI_F, 1e-3f);
+  // each axis: split its footprint into a flat plateau + a Gaussian shoulder.
+  // feather=1 -> pure Gaussian (legacy look); feather=0 -> hard top-hat band.
+  const float f = CLAMP(n->feather, 0.0f, 1.0f);
+  const float base_h = fmaxf(n->reach * M_PI_F, 1e-3f);
+  nd->hw_h = (1.0f - f) * base_h; nd->sigma_h = fmaxf(f * base_h, 1e-3f);
   nd->sat_center = n->select_sat * n->select_sat * 0.1f;
-  nd->sat_sigma = fmaxf(n->sat_range * 0.3f, 1e-4f);
+  const float base_s = fmaxf(n->sat_range * 0.3f, 1e-4f);
+  nd->hw_s = (1.0f - f) * base_s; nd->sat_sigma = fmaxf(f * base_s, 1e-4f);
   nd->light_center = n->select_light;
-  nd->light_sigma = fmaxf(n->light_range * 3.0f, 0.02f);
+  const float base_l = fmaxf(n->light_range * 3.0f, 0.02f);
+  nd->hw_l = (1.0f - f) * base_l; nd->light_sigma = fmaxf(f * base_l, 0.02f);
+  const float guard = 0.003f + CLAMP(n->neutral_protect, 0.0f, 1.0f) * 0.06f;
+  nd->guard2 = guard * guard;
   nd->invert = n->invert ? 1 : 0;
   nd->sel_hue = n->center_hue;
   nd->sel_sat = n->select_sat;
@@ -497,6 +516,7 @@ static void _cw_scratch_node(const dt_iop_colorwarp_params_t *p, dt_iop_colorwar
   n->strength = p->strength; n->center_hue = p->center_hue; n->reach = p->reach;
   n->select_sat = p->select_sat; n->sat_range = p->sat_range;
   n->select_light = p->select_light; n->light_range = p->light_range;
+  n->feather = p->feather; n->neutral_protect = p->neutral_protect;
   n->invert = p->invert ? 1 : 0;
   n->shift_hue = p->shift_hue; n->shift_chroma = p->shift_chroma; n->shift_lightness = p->shift_lightness;
   n->convergence = p->convergence; n->affinity = p->affinity;
@@ -988,6 +1008,7 @@ static void _cw_default_node(dt_iop_colorwarp_node_t *n)
   n->center_hue = 0.5f; n->reach = 1.0f;
   n->select_sat = 0.5f; n->sat_range = 1.0f;
   n->select_light = 0.5f; n->light_range = 1.0f;
+  n->feather = 0.5f; n->neutral_protect = 0.0f;
 }
 
 // copy a node struct into the flat editor fields
@@ -996,6 +1017,7 @@ static void _cw_node_to_flat(dt_iop_colorwarp_params_t *p, const dt_iop_colorwar
   p->strength = n->strength; p->center_hue = n->center_hue; p->reach = n->reach;
   p->select_sat = n->select_sat; p->sat_range = n->sat_range;
   p->select_light = n->select_light; p->light_range = n->light_range;
+  p->feather = n->feather; p->neutral_protect = n->neutral_protect;
   p->invert = n->invert; p->shift_hue = n->shift_hue; p->shift_chroma = n->shift_chroma;
   p->shift_lightness = n->shift_lightness; p->convergence = n->convergence; p->affinity = n->affinity;
   p->neutral_zone = n->neutral_zone; p->priority = n->priority; p->per_component = n->per_component;
@@ -1018,6 +1040,8 @@ static void _cw_sync_sliders(dt_iop_module_t *self)
   dt_bauhaus_slider_set(g->sat_range, p->sat_range);
   dt_bauhaus_slider_set(g->select_light, p->select_light);
   dt_bauhaus_slider_set(g->light_range, p->light_range);
+  dt_bauhaus_slider_set(g->feather, p->feather);
+  dt_bauhaus_slider_set(g->neutral_protect, p->neutral_protect);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->invert), p->invert);
   dt_bauhaus_slider_set(g->shift_hue, p->shift_hue);
   dt_bauhaus_slider_set(g->shift_chroma, p->shift_chroma);
@@ -1285,6 +1309,15 @@ void gui_init(dt_iop_module_t *self)
   g->light_range = dt_bauhaus_slider_from_params(self, "light_range");
   gtk_widget_set_tooltip_text(g->light_range, _("how wide a lightness band around the target is affected.\n"
                                                "max = affect all lightnesses (no restriction)."));
+
+  g->feather = dt_bauhaus_slider_from_params(self, "feather");
+  gtk_widget_set_tooltip_text(g->feather, _("transition softness at the selection edges.\n"
+                                           "0 = hard-edged band (range = fully-selected zone);\n"
+                                           "1 = fully feathered (smooth Gaussian falloff, no plateau)."));
+
+  g->neutral_protect = dt_bauhaus_slider_from_params(self, "neutral_protect");
+  gtk_widget_set_tooltip_text(g->neutral_protect, _("fade the selection out at low chroma, where hue is noisy\n"
+                                                   "(RAW shadows). raise to keep near-neutral pixels untouched."));
 
   g->invert = dt_bauhaus_toggle_from_params(self, "invert");
   gtk_widget_set_tooltip_text(g->invert, _("invert the selection: affect everything EXCEPT the\n"
