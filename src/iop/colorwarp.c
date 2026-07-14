@@ -249,6 +249,16 @@ static inline float _cw_band_w(const float ad, const float hw, const float inv_2
   return expf(-(e * e) * inv_2sig2);
 }
 
+// invert the dt UCS saturation metric S = C/(J*(C^1.336+1)) for C, given S and J.
+// fixed-point C = S*J*(C^1.336+1) converges in a few steps; used per node (target chroma).
+static inline float _cw_S_to_C(const float S, const float J)
+{
+  if(S <= 0.0f || J <= 0.0f) return 0.0f;
+  float C = S * J;
+  for(int i = 0; i < 6; i++) C = S * J * (powf(fmaxf(C, 0.0f), 1.33654221029386f) + 1.0f);
+  return C;
+}
+
 static inline float _cw_neutral_radius(const float neutral)
 {
   const float n = CLAMP(neutral, 0.0f, 1.0f);
@@ -445,10 +455,19 @@ void process(dt_iop_module_t *self,
       selbuf = fb;
     }
 
-    const float conv = nd->convergence, affinity = nd->affinity, neutral = nd->neutral_zone, prio = nd->priority;
-    const float c_hue = nd->sel_hue,     t_hue = nd->sel_hue + nd->shift_hue;
-    const float c_sat = nd->sel_sat,     t_sat = nd->sel_sat + nd->shift_chroma;
-    const float c_lgt = nd->light_center, t_lgt = nd->light_center + nd->shift_lightness;
+    // move works in dt UCS chroma-Cartesian (J, a, b): a stable, absolute chroma plane
+    // (the 3D LUT Creator A/B grid the canvas draws). target & centre are per-node constants.
+    const float conv = nd->convergence, affinity = nd->affinity, neutral = nd->neutral_zone;
+    const float th_ang = (nd->sel_hue + nd->shift_hue) * (2.0f * M_PI_F) - M_PI_F;
+    const float ch_ang = nd->sel_hue * (2.0f * M_PI_F) - M_PI_F;
+    const float t_lgt = nd->light_center + nd->shift_lightness;
+    const float c_lgt = nd->light_center;
+    const float ts = CLAMP(nd->sel_sat + nd->shift_chroma, 0.0f, 2.0f);
+    const float cs = CLAMP(nd->sel_sat, 0.0f, 2.0f);
+    const float Ct = _cw_S_to_C(ts * ts * 0.1f, fmaxf(t_lgt, 1e-4f));
+    const float Cc = _cw_S_to_C(cs * cs * 0.1f, fmaxf(c_lgt, 1e-4f));
+    const float a_t = Ct * cosf(th_ang), b_t = Ct * sinf(th_ang);
+    const float a_c = Cc * cosf(ch_ang), b_c = Cc * sinf(ch_ang);
     const float strength = nd->strength;
 
     DT_OMP_FOR()
@@ -462,35 +481,32 @@ void process(dt_iop_module_t *self,
       dt_aligned_pixel_t JCH;
       dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
       const float J = JCH[0], C = JCH[1], h = JCH[2];
-      const float hue_p = (h + M_PI_F) / (2.0f * M_PI_F);
-      const float S_in = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
-      const float sat_p = sqrtf(fmaxf(S_in, 0.0f) / 0.1f);
-      const float lgt_p = J;
-
-      float dth = t_hue - hue_p; dth -= roundf(dth);
-      const float dts = t_sat - sat_p, dtl = t_lgt - lgt_p;
-      float dct_h = t_hue - c_hue; dct_h -= roundf(dct_h);
-      const float dct_s = t_sat - c_sat, dct_l = t_lgt - c_lgt;
+      const float a_p = C * cosf(h), b_p = C * sinf(h);   // pixel chroma-Cartesian
       const float w_base = strength * selbuf[k];
 
+      // acc_h / acc_s hold the (a, b) chroma delta, acc_l the lightness delta.
+      // translate part uses (target - centre); converge part pulls (target - value).
       if(nd->per_component)
       {
-        acc_h[k] += _cw_axis_move(dct_h, dth, w_base, nd->conv_h, nd->aff_h, nd->nz_h, nd->prio_h);
-        acc_s[k] += _cw_axis_move(dct_s, dts, w_base, nd->conv_c, nd->aff_c, nd->nz_c, nd->prio_c);
-        acc_l[k] += _cw_axis_move(dct_l, dtl, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->prio_l);
+        const float da = a_t - a_p, db = b_t - b_p;
+        const float distc = sqrtf(da * da + db * db);            // chroma plane uses the "saturation" set
+        const float w = w_base * _cw_affinity_weight(nd->aff_c, nd->nz_c, distc);
+        const float wt = w * (1.0f - nd->conv_c);
+        const float wc = (nd->conv_c > 0.0f) ? fminf(w * nd->conv_c, 1.0f) : w * nd->conv_c;
+        acc_h[k] += wt * (a_t - a_c) + wc * da;
+        acc_s[k] += wt * (b_t - b_c) + wc * db;
+        acc_l[k] += _cw_axis_move(t_lgt - c_lgt, t_lgt - J, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->prio_l);
       }
       else
       {
-        const float dist = sqrtf(dth * dth + dts * dts + dtl * dtl);
+        const float da = a_t - a_p, db = b_t - b_p, dl = t_lgt - J;
+        const float dist = sqrtf(da * da + db * db + dl * dl);
         const float w = w_base * _cw_affinity_weight(affinity, neutral, dist);
         const float wt = w * (1.0f - conv);
         const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
-        const float ph = CLAMP(1.0f - prio * tanhf(dth * 4.0f), 0.0f, 2.0f);
-        const float ps = CLAMP(1.0f - prio * tanhf(dts * 4.0f), 0.0f, 2.0f);
-        const float pl = CLAMP(1.0f - prio * tanhf(dtl * 4.0f), 0.0f, 2.0f);
-        acc_h[k] += ph * (wt * dct_h + wc * dth);
-        acc_s[k] += ps * (wt * dct_s + wc * dts);
-        acc_l[k] += pl * (wt * dct_l + wc * dtl);
+        acc_h[k] += wt * (a_t - a_c) + wc * da;
+        acc_s[k] += wt * (b_t - b_c) + wc * db;
+        acc_l[k] += wt * (t_lgt - c_lgt) + wc * dl;
       }
     }
   }
@@ -530,28 +546,20 @@ void process(dt_iop_module_t *self,
     dt_aligned_pixel_t JCH;
     dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
     const float J = JCH[0], C = JCH[1], h = JCH[2];
-    const float hue_p = (h + M_PI_F) / (2.0f * M_PI_F);
-    const float S_in = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
-    const float sat_p = sqrtf(fmaxf(S_in, 0.0f) / 0.1f);
-    const float lgt_p = J;
-
-    const float hue_o = hue_p + acc_h[k];
-    const float sat_o = fmaxf(sat_p + acc_s[k], 0.0f);
-    const float J2 = fmaxf(lgt_p + acc_l[k], 0.0f);
+    const float a_o = C * cosf(h) + acc_h[k];   // apply the (a, b) chroma + lightness delta
+    const float b_o = C * sinf(h) + acc_s[k];
+    const float J2 = fmaxf(J + acc_l[k], 0.0f);
 
     if(mask_mode == 1)
     {
-      float dhue = hue_o - hue_p; dhue -= roundf(dhue);
-      const float mh = 2.0f * dhue * sat_p;
-      const float mag = sqrtf(mh * mh + (sat_o - sat_p) * (sat_o - sat_p) + (J2 - lgt_p) * (J2 - lgt_p));
-      const float grey = CLAMP(mag * 1.5f, 0.0f, 1.0f);
+      const float mag = sqrtf(acc_h[k] * acc_h[k] + acc_s[k] * acc_s[k] + acc_l[k] * acc_l[k]);
+      const float grey = CLAMP(mag * 4.0f, 0.0f, 1.0f);
       out[0] = out[1] = out[2] = grey; out[3] = in[3];
       continue;
     }
 
-    const float S_out = sat_o * sat_o * 0.1f;
-    const float C2 = fmaxf(C * (S_out / fmaxf(S_in, 1e-6f)), 0.0f);
-    const float h2 = hue_o * (2.0f * M_PI_F) - M_PI_F;
+    const float C2 = hypotf(a_o, b_o);           // chroma & hue rebuilt directly, no S ratio
+    const float h2 = atan2f(b_o, a_o);
     dt_aligned_pixel_t JCH2 = { J2, C2, h2, 0.f }, xyY, xyz65, xyz50, rgb_out;
     dt_UCS_JCH_to_xyY(JCH2, L_white, xyY);
     dt_xyY_to_XYZ(xyY, xyz65);
