@@ -52,6 +52,43 @@
 
 DT_MODULE_INTROSPECTION(1, dt_iop_colorwarp_params_t)
 
+#define CW_MAX_NODES 8
+
+// one attractor node: everything that defines a selection + its directed move.
+// (mirrors the flat "scratch" fields below, which are the live editor for the active node)
+typedef struct dt_iop_colorwarp_node_t
+{
+  float strength;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float center_hue;       // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
+  float reach;            // $MIN: 0.05 $MAX: 1.0 $DEFAULT: 1.0
+  float select_sat;       // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
+  float sat_range;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0
+  float select_light;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
+  float light_range;      // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 1.0
+  int invert;             // $DEFAULT: 0
+  float shift_hue;        // $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0
+  float shift_chroma;     // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float shift_lightness;  // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float convergence;      // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float affinity;         // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float neutral_zone;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float priority;         // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  int per_component;      // $DEFAULT: 0
+  float conv_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float aff_h;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float nz_h;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float prio_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float conv_c;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float aff_c;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float nz_c;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float prio_c;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float conv_l;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float aff_l;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  float nz_l;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float prio_l;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
+  int absolute_target;    // $DEFAULT: 0
+} dt_iop_colorwarp_node_t;
+
 typedef struct dt_iop_colorwarp_params_t
 {
   float strength;         // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "strength"
@@ -89,6 +126,10 @@ typedef struct dt_iop_colorwarp_params_t
   gboolean absolute_target; // $DEFAULT: FALSE $DESCRIPTION: "absolute target"
   float smoothing;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.25 $DESCRIPTION: "smoothing"
   float edge;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.3 $DESCRIPTION: "edge threshold"
+  // --- multi-node (field): the flat fields above are the live editor for node[active_node] ---
+  int num_nodes;          // $MIN: 1 $MAX: 8 $DEFAULT: 1 $DESCRIPTION: "nodes"
+  int active_node;        // $MIN: 0 $MAX: 7 $DEFAULT: 0
+  dt_iop_colorwarp_node_t node[CW_MAX_NODES];
 } dt_iop_colorwarp_params_t;
 
 typedef struct dt_iop_colorwarp_gui_data_t
@@ -109,7 +150,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   int drag;               // 0=none, 1=source, 2=target
 } dt_iop_colorwarp_gui_data_t;
 
-typedef struct dt_iop_colorwarp_data_t
+typedef struct dt_iop_colorwarp_nodedata_t
 {
   float strength;
   float hc;              // selected hue centre (radians)
@@ -132,8 +173,14 @@ typedef struct dt_iop_colorwarp_data_t
   float conv_h, aff_h, nz_h, prio_h;   // per-component affinity: hue
   float conv_c, aff_c, nz_c, prio_c;   //                         saturation
   float conv_l, aff_l, nz_l, prio_l;   //                         lightness
-  float smoothing;       // spatial mask smoothing amount [0,1]
-  float edge_eps;        // guided-filter sqrt_eps (edge sensitivity)
+} dt_iop_colorwarp_nodedata_t;
+
+typedef struct dt_iop_colorwarp_data_t
+{
+  int num_nodes;
+  dt_iop_colorwarp_nodedata_t nd[CW_MAX_NODES];   // resolved, process-ready nodes
+  float smoothing;       // spatial mask smoothing amount [0,1] (global)
+  float edge_eps;        // guided-filter sqrt_eps (edge sensitivity) (global)
 } dt_iop_colorwarp_data_t;
 
 
@@ -235,95 +282,142 @@ void process(dt_iop_module_t *self,
   const dt_iop_colorwarp_gui_data_t *const gd = self->gui_data;
   const int mask_mode = (gd && dt_pipe_is_full(piece->pipe)) ? gd->mask_mode : 0;
 
-  if(!work_profile || (d->strength <= 0.f && !mask_mode))
+  gboolean any = FALSE;
+  for(int n = 0; n < d->num_nodes; n++) if(d->nd[n].strength > 0.f) any = TRUE;
+  if(!work_profile || (!any && !mask_mode))
   {
     dt_iop_image_copy_by_size(ovoid, ivoid, W, H, 4);
     return;
   }
 
+  // RAM-safe field: one reusable mask buffer + move accumulators (never N masks at once)
   float *const restrict mask = dt_alloc_align_float(npixels);
-  if(!mask)
+  float *const restrict mask_f = dt_alloc_align_float(npixels);
+  float *const restrict acc_h = dt_alloc_align_float(npixels);
+  float *const restrict acc_s = dt_alloc_align_float(npixels);
+  float *const restrict acc_l = dt_alloc_align_float(npixels);
+  float *const restrict sel_acc = (mask_mode == 2) ? dt_alloc_align_float(npixels) : NULL;
+  if(!mask || !mask_f || !acc_h || !acc_s || !acc_l || (mask_mode == 2 && !sel_acc))
   {
+    dt_free_align(mask); dt_free_align(mask_f); dt_free_align(acc_h);
+    dt_free_align(acc_s); dt_free_align(acc_l); dt_free_align(sel_acc);
     dt_iop_image_copy_by_size(ovoid, ivoid, W, H, 4);
     return;
   }
 
-  const float hc = d->hc;                           // selected hue centre (radians)
-  const float inv_2sh2 = 1.0f / (2.0f * d->sigma_h * d->sigma_h);
-  const float sat_center = d->sat_center;
-  const float inv_2ss2 = 1.0f / (2.0f * d->sat_sigma * d->sat_sigma);
-  const float light_center = d->light_center;
-  const float inv_2sl2 = 1.0f / (2.0f * d->light_sigma * d->light_sigma);
-  const int invert = d->invert;
-  const float guard2 = 0.003f * 0.003f;             // fixed neutral guard (kill hue noise on greys)
-
-  // pass 1: selection = hue band * saturation band * lightness band, optionally inverted,
-  //         then * neutral guard (always protects greys, even when inverted)
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
-    const float *const restrict in = (const float *)ivoid + 4 * k;
-    const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
-    dt_aligned_pixel_t JCH;
-    dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
-
-    const float J = JCH[0], C = JCH[1], h = JCH[2];
-    const float sat = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
-
-    const float dh = atan2f(sinf(h - hc), cosf(h - hc));   // shortest angular distance
-    const float hue_w = expf(-(dh * dh) * inv_2sh2);
-    const float ds = sat - sat_center;
-    const float sat_w = expf(-(ds * ds) * inv_2ss2);       // saturation band
-    const float dl = J - light_center;
-    const float light_w = expf(-(dl * dl) * inv_2sl2);     // lightness band
-
-    float sel = hue_w * sat_w * light_w;
-    if(invert) sel = 1.0f - sel;
-    const float guard = (sat * sat) / (sat * sat + guard2);
-    mask[k] = sel * guard;
+    acc_h[k] = acc_s[k] = acc_l[k] = 0.0f;
+    if(sel_acc) sel_acc[k] = 0.0f;
   }
 
-  // smooth the mask -> kills hue-noise speckle from tight selections. We use an
-  // EDGE-AWARE guided filter (guided by the scene RGB) so the selection follows real
-  // image edges: no halo bleeding across e.g. a hair/skin boundary, unlike a plain
-  // Gaussian. Window scales with the preview<->full-res ratio for scale consistency.
-  const float *restrict sel = mask;
-  float *restrict mask_f = NULL;
+  const float guard2 = 0.003f * 0.003f;
   const int gw = (int)(d->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
-  if(d->smoothing > 0.f && gw >= 1)
+
+  // --- per node: build its mask, smooth it, accumulate its move (superposition field) ---
+  for(int n = 0; n < d->num_nodes; n++)
   {
-    mask_f = dt_alloc_align_float(npixels);
-    if(mask_f)
+    const dt_iop_colorwarp_nodedata_t *const nd = &d->nd[n];
+    if(nd->strength <= 0.f && mask_mode != 2) continue;   // inactive nodes still shown in the mask
+
+    const float hc = nd->hc;
+    const float inv_2sh2 = 1.0f / (2.0f * nd->sigma_h * nd->sigma_h);
+    const float sat_center = nd->sat_center;
+    const float inv_2ss2 = 1.0f / (2.0f * nd->sat_sigma * nd->sat_sigma);
+    const float light_center = nd->light_center;
+    const float inv_2sl2 = 1.0f / (2.0f * nd->light_sigma * nd->light_sigma);
+    const int invert = nd->invert;
+
+    DT_OMP_FOR()
+    for(size_t k = 0; k < npixels; k++)
     {
-      // guide = input RGB (ch=4); edge_eps sets edge sensitivity in scene-linear units
+      const float *const restrict in = (const float *)ivoid + 4 * k;
+      const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
+      dt_aligned_pixel_t JCH;
+      dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
+      const float J = JCH[0], C = JCH[1], h = JCH[2];
+      const float sat = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
+      const float dh = atan2f(sinf(h - hc), cosf(h - hc));
+      const float hue_w = expf(-(dh * dh) * inv_2sh2);
+      const float ds = sat - sat_center;
+      const float sat_w = expf(-(ds * ds) * inv_2ss2);
+      const float dl = J - light_center;
+      const float light_w = expf(-(dl * dl) * inv_2sl2);
+      float sel = hue_w * sat_w * light_w;
+      if(invert) sel = 1.0f - sel;
+      mask[k] = sel * (sat * sat) / (sat * sat + guard2);
+    }
+
+    const float *restrict selbuf = mask;
+    if(d->smoothing > 0.f && gw >= 1)
+    {
       guided_filter(ivoid, mask, mask_f, W, H, 4, gw, d->edge_eps, 1.0f, 0.0f, 1.0f);
-      sel = mask_f;
+      selbuf = mask_f;
+    }
+
+    const float conv = nd->convergence, affinity = nd->affinity, neutral = nd->neutral_zone, prio = nd->priority;
+    const float c_hue = nd->sel_hue,     t_hue = nd->sel_hue + nd->shift_hue;
+    const float c_sat = nd->sel_sat,     t_sat = nd->sel_sat + nd->shift_chroma;
+    const float c_lgt = nd->light_center, t_lgt = nd->light_center + nd->shift_lightness;
+    const float strength = nd->strength;
+
+    DT_OMP_FOR()
+    for(size_t k = 0; k < npixels; k++)
+    {
+      if(sel_acc) sel_acc[k] = fmaxf(sel_acc[k], selbuf[k]);
+      if(strength <= 0.f) continue;
+
+      const float *const restrict in = (const float *)ivoid + 4 * k;
+      const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
+      dt_aligned_pixel_t JCH;
+      dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
+      const float J = JCH[0], C = JCH[1], h = JCH[2];
+      const float hue_p = (h + M_PI_F) / (2.0f * M_PI_F);
+      const float S_in = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
+      const float sat_p = sqrtf(fmaxf(S_in, 0.0f) / 0.1f);
+      const float lgt_p = J;
+
+      float dth = t_hue - hue_p; dth -= roundf(dth);
+      const float dts = t_sat - sat_p, dtl = t_lgt - lgt_p;
+      float dct_h = t_hue - c_hue; dct_h -= roundf(dct_h);
+      const float dct_s = t_sat - c_sat, dct_l = t_lgt - c_lgt;
+      const float w_base = strength * selbuf[k];
+
+      if(nd->per_component)
+      {
+        acc_h[k] += _cw_axis_move(dct_h, dth, w_base, nd->conv_h, nd->aff_h, nd->nz_h, nd->prio_h);
+        acc_s[k] += _cw_axis_move(dct_s, dts, w_base, nd->conv_c, nd->aff_c, nd->nz_c, nd->prio_c);
+        acc_l[k] += _cw_axis_move(dct_l, dtl, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->prio_l);
+      }
+      else
+      {
+        const float dist = sqrtf(dth * dth + dts * dts + dtl * dtl);
+        const float w = w_base * _cw_affinity_weight(affinity, neutral, dist);
+        const float wt = w * (1.0f - conv);
+        const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
+        const float ph = CLAMP(1.0f - prio * tanhf(dth * 4.0f), 0.0f, 2.0f);
+        const float ps = CLAMP(1.0f - prio * tanhf(dts * 4.0f), 0.0f, 2.0f);
+        const float pl = CLAMP(1.0f - prio * tanhf(dtl * 4.0f), 0.0f, 2.0f);
+        acc_h[k] += ph * (wt * dct_h + wc * dth);
+        acc_s[k] += ps * (wt * dct_s + wc * dts);
+        acc_l[k] += pl * (wt * dct_l + wc * dtl);
+      }
     }
   }
 
-  const float strength = d->strength;
-  const float conv = d->convergence;
-  const float affinity = d->affinity, neutral = d->neutral_zone;
-  const float prio = d->priority;
-  // selection centre and absolute target, in the canvas coordinates of each axis
-  const float c_hue = d->sel_hue,   t_hue = d->sel_hue + d->shift_hue;              // turns
-  const float c_sat = d->sel_sat,   t_sat = d->sel_sat + d->shift_chroma;           // canvas [0,1]
-  const float c_lgt = d->light_center, t_lgt = d->light_center + d->shift_lightness; // dt UCS J
-
-  // mask display overrides the image with a grayscale mask, in the darkroom preview only
   if(mask_mode) piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
 
-  // pass 2: move each selected pixel by w * [ (1-aff)*(target-centre) + aff*(target-value) ]
-  //   aff = 0 translate (grade) ; aff = 1 converge to target (uniformity) ; aff < 0 diverge
+  // --- apply the accumulated move (or write the grayscale mask) ---
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
     const float *const restrict in = (const float *)ivoid + 4 * k;
     float *const restrict out = (float *)ovoid + 4 * k;
 
-    if(mask_mode == 2)   // selection mask: where the tool acts (before the move)
+    if(mask_mode == 2)
     {
-      const float grey = sel[k];
+      const float grey = CLAMP(sel_acc[k], 0.0f, 1.0f);
       out[0] = out[1] = out[2] = grey; out[3] = in[3];
       continue;
     }
@@ -331,74 +425,82 @@ void process(dt_iop_module_t *self,
     const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
     dt_aligned_pixel_t JCH;
     dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
-
     const float J = JCH[0], C = JCH[1], h = JCH[2];
-
-    // pixel values in the same canvas coordinates
     const float hue_p = (h + M_PI_F) / (2.0f * M_PI_F);
     const float S_in = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
-    const float sat_p = sqrtf(fmaxf(S_in, 0.0f) / 0.1f);   // inverse of sat_center map
+    const float sat_p = sqrtf(fmaxf(S_in, 0.0f) / 0.1f);
     const float lgt_p = J;
 
-    // per-axis pixel-to-target (dt) and centre-to-target (dtc) offsets (hue wrapped)
-    float dth = t_hue - hue_p; dth -= roundf(dth);
-    const float dts = t_sat - sat_p, dtl = t_lgt - lgt_p;
-    float dct_h = t_hue - c_hue; dct_h -= roundf(dct_h);
-    const float dct_s = t_sat - c_sat, dct_l = t_lgt - c_lgt;
-    const float w_base = strength * sel[k];
+    const float hue_o = hue_p + acc_h[k];
+    const float sat_o = fmaxf(sat_p + acc_s[k], 0.0f);
+    const float J2 = fmaxf(lgt_p + acc_l[k], 0.0f);
 
-    float move_h, move_s, move_l;
-    if(d->per_component)   // each axis: its own convergence/affinity/neutral/priority, own distance
-    {
-      move_h = _cw_axis_move(dct_h, dth, w_base, d->conv_h, d->aff_h, d->nz_h, d->prio_h);
-      move_s = _cw_axis_move(dct_s, dts, w_base, d->conv_c, d->aff_c, d->nz_c, d->prio_c);
-      move_l = _cw_axis_move(dct_l, dtl, w_base, d->conv_l, d->aff_l, d->nz_l, d->prio_l);
-    }
-    else                  // global: one affinity weight from the 3D distance, shared controls
-    {
-      const float dist = sqrtf(dth * dth + dts * dts + dtl * dtl);
-      const float w = w_base * _cw_affinity_weight(affinity, neutral, dist);
-      const float wt = w * (1.0f - conv);
-      const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
-      const float ph = CLAMP(1.0f - prio * tanhf(dth * 4.0f), 0.0f, 2.0f);
-      const float ps = CLAMP(1.0f - prio * tanhf(dts * 4.0f), 0.0f, 2.0f);
-      const float pl = CLAMP(1.0f - prio * tanhf(dtl * 4.0f), 0.0f, 2.0f);
-      move_h = ph * (wt * dct_h + wc * dth);
-      move_s = ps * (wt * dct_s + wc * dts);
-      move_l = pl * (wt * dct_l + wc * dtl);
-    }
-
-    const float hue_o = hue_p + move_h;
-    const float h2 = hue_o * (2.0f * M_PI_F) - M_PI_F;
-    const float sat_o = fmaxf(sat_p + move_s, 0.0f);
-    const float S_out = sat_o * sat_o * 0.1f;
-    const float C2 = fmaxf(C * (S_out / fmaxf(S_in, 1e-6f)), 0.0f);
-    const float J2 = fmaxf(lgt_p + move_l, 0.0f);
-
-    if(mask_mode == 1)   // correction intensity: how far the pixel actually moved (affinity-aware)
+    if(mask_mode == 1)
     {
       float dhue = hue_o - hue_p; dhue -= roundf(dhue);
-      const float mh = 2.0f * dhue * sat_p;              // hue change weighted by chroma
+      const float mh = 2.0f * dhue * sat_p;
       const float mag = sqrtf(mh * mh + (sat_o - sat_p) * (sat_o - sat_p) + (J2 - lgt_p) * (J2 - lgt_p));
       const float grey = CLAMP(mag * 1.5f, 0.0f, 1.0f);
       out[0] = out[1] = out[2] = grey; out[3] = in[3];
       continue;
     }
 
+    const float S_out = sat_o * sat_o * 0.1f;
+    const float C2 = fmaxf(C * (S_out / fmaxf(S_in, 1e-6f)), 0.0f);
+    const float h2 = hue_o * (2.0f * M_PI_F) - M_PI_F;
     dt_aligned_pixel_t JCH2 = { J2, C2, h2, 0.f }, xyY, xyz65, xyz50, rgb_out;
     dt_UCS_JCH_to_xyY(JCH2, L_white, xyY);
     dt_xyY_to_XYZ(xyY, xyz65);
     XYZ_D65_to_D50(xyz65, xyz50);
     dt_apply_transposed_color_matrix(xyz50, work_profile->matrix_out_transposed, rgb_out);
-
-    out[0] = rgb_out[0];
-    out[1] = rgb_out[1];
-    out[2] = rgb_out[2];
-    out[3] = in[3];
+    out[0] = rgb_out[0]; out[1] = rgb_out[1]; out[2] = rgb_out[2]; out[3] = in[3];
   }
 
-  dt_free_align(mask);
-  dt_free_align(mask_f);
+  dt_free_align(mask); dt_free_align(mask_f);
+  dt_free_align(acc_h); dt_free_align(acc_s); dt_free_align(acc_l); dt_free_align(sel_acc);
+}
+
+// resolve a raw params node into process-ready values (band sigmas, centre coords, ...)
+static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_nodedata_t *nd)
+{
+  nd->strength = n->strength;
+  nd->hc = n->center_hue * (2.0f * M_PI_F) - M_PI_F;   // [0,1] -> [-pi,pi]
+  nd->sigma_h = fmaxf(n->reach * M_PI_F, 1e-3f);
+  nd->sat_center = n->select_sat * n->select_sat * 0.1f;
+  nd->sat_sigma = fmaxf(n->sat_range * 0.3f, 1e-4f);
+  nd->light_center = n->select_light;
+  nd->light_sigma = fmaxf(n->light_range * 3.0f, 0.02f);
+  nd->invert = n->invert ? 1 : 0;
+  nd->sel_hue = n->center_hue;
+  nd->sel_sat = n->select_sat;
+  nd->shift_hue = n->shift_hue;
+  nd->shift_chroma = n->shift_chroma;
+  nd->shift_lightness = n->shift_lightness;
+  nd->convergence = n->convergence;
+  nd->affinity = n->affinity;
+  nd->neutral_zone = n->neutral_zone;
+  nd->priority = n->priority;
+  nd->per_component = n->per_component ? 1 : 0;
+  nd->conv_h = n->conv_h; nd->aff_h = n->aff_h; nd->nz_h = n->nz_h; nd->prio_h = n->prio_h;
+  nd->conv_c = n->conv_c; nd->aff_c = n->aff_c; nd->nz_c = n->nz_c; nd->prio_c = n->prio_c;
+  nd->conv_l = n->conv_l; nd->aff_l = n->aff_l; nd->nz_l = n->nz_l; nd->prio_l = n->prio_l;
+}
+
+// copy the flat "scratch" fields (the live editor for the active node) into a node struct
+static void _cw_scratch_node(const dt_iop_colorwarp_params_t *p, dt_iop_colorwarp_node_t *n)
+{
+  n->strength = p->strength; n->center_hue = p->center_hue; n->reach = p->reach;
+  n->select_sat = p->select_sat; n->sat_range = p->sat_range;
+  n->select_light = p->select_light; n->light_range = p->light_range;
+  n->invert = p->invert ? 1 : 0;
+  n->shift_hue = p->shift_hue; n->shift_chroma = p->shift_chroma; n->shift_lightness = p->shift_lightness;
+  n->convergence = p->convergence; n->affinity = p->affinity;
+  n->neutral_zone = p->neutral_zone; n->priority = p->priority;
+  n->per_component = p->per_component ? 1 : 0;
+  n->conv_h = p->conv_h; n->aff_h = p->aff_h; n->nz_h = p->nz_h; n->prio_h = p->prio_h;
+  n->conv_c = p->conv_c; n->aff_c = p->aff_c; n->nz_c = p->nz_c; n->prio_c = p->prio_c;
+  n->conv_l = p->conv_l; n->aff_l = p->aff_l; n->nz_l = p->nz_l; n->prio_l = p->prio_l;
+  n->absolute_target = p->absolute_target ? 1 : 0;
 }
 
 void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_t *pipe,
@@ -407,33 +509,15 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   const dt_iop_colorwarp_params_t *p = (dt_iop_colorwarp_params_t *)p1;
   dt_iop_colorwarp_data_t *d = piece->data;
 
-  d->strength = p->strength;
-  // uniform "centre + range" band on each selection axis; range max -> ~flat = select all
-  d->hc = p->center_hue * (2.0f * M_PI_F) - M_PI_F;   // [0,1] -> [-pi,pi]
-  d->sigma_h = fmaxf(p->reach * M_PI_F, 1e-3f);       // hue range -> angular half-width
-  // saturation: centre & sigma in raw dt UCS S (small quantity, ~[0,0.1]); quadratic
-  // map gives fine low-end control. gamut-normalised S is a later refinement.
-  d->sat_center = p->select_sat * p->select_sat * 0.1f;
-  d->sat_sigma = fmaxf(p->sat_range * 0.3f, 1e-4f);
-  d->light_center = p->select_light;                  // dt UCS J
-  d->light_sigma = fmaxf(p->light_range * 3.0f, 0.02f);
-  d->invert = p->invert ? 1 : 0;
-  d->sel_hue = p->center_hue;                          // canvas coords of the selection centre
-  d->sel_sat = p->select_sat;
-  d->shift_hue = p->shift_hue;
-  d->shift_chroma = p->shift_chroma;
-  d->shift_lightness = p->shift_lightness;
-  d->convergence = p->convergence;
-  d->affinity = p->affinity;
-  d->neutral_zone = p->neutral_zone;
-  d->priority = p->priority;
-  d->per_component = p->per_component ? 1 : 0;
-  d->conv_h = p->conv_h; d->aff_h = p->aff_h; d->nz_h = p->nz_h; d->prio_h = p->prio_h;
-  d->conv_c = p->conv_c; d->aff_c = p->aff_c; d->nz_c = p->nz_c; d->prio_c = p->prio_c;
-  d->conv_l = p->conv_l; d->aff_l = p->aff_l; d->nz_l = p->nz_l; d->prio_l = p->prio_l;
+  dt_iop_colorwarp_node_t scratch;
+  _cw_scratch_node(p, &scratch);          // the flat fields are the active node's live values
+  const int nn = CLAMP(p->num_nodes, 1, CW_MAX_NODES);
+  const int act = CLAMP(p->active_node, 0, nn - 1);
+  d->num_nodes = nn;
+  for(int i = 0; i < nn; i++)
+    _cw_resolve_node((i == act) ? &scratch : &p->node[i], &d->nd[i]);
+
   d->smoothing = p->smoothing;
-  // edge threshold -> guided-filter sqrt_eps, quadratic for fine low-end control.
-  // low = follow even faint edges (sharp mask); high = smooth across them (-> plain blur)
   d->edge_eps = fmaxf(p->edge * p->edge * 0.3f, 1e-4f);
 }
 
