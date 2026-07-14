@@ -35,6 +35,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/chromatic_adaptation.h"
 #include "common/colorspaces_inline_conversions.h"
+#include "common/eigf.h"
 #include "common/guided_filter.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
@@ -130,6 +131,7 @@ typedef struct dt_iop_colorwarp_params_t
   gboolean absolute_target; // $DEFAULT: FALSE $DESCRIPTION: "absolute target"
   float smoothing;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.25 $DESCRIPTION: "smoothing"
   float edge;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.3 $DESCRIPTION: "edge threshold"
+  gboolean use_eigf;      // $DEFAULT: FALSE $DESCRIPTION: "exposure-independent filter"
   // --- multi-node (field): the flat fields above are the live editor for node[active_node] ---
   int num_nodes;          // $MIN: 1 $MAX: 8 $DEFAULT: 1 $DESCRIPTION: "nodes"
   int active_node;        // $MIN: 0 $MAX: 7 $DEFAULT: 0
@@ -141,7 +143,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *strength, *center_hue, *reach, *select_sat, *sat_range, *select_light, *light_range, *invert;
   GtkWidget *feather, *neutral_protect;
   GtkWidget *shift_hue, *shift_chroma, *shift_lightness, *convergence, *affinity;
-  GtkWidget *neutral_zone, *priority, *absolute_target, *smoothing, *edge;
+  GtkWidget *neutral_zone, *priority, *absolute_target, *smoothing, *edge, *use_eigf;
   GtkNotebook *aff_notebook;   // affinity: global + per-component pages
   GtkWidget *conv_h, *aff_h, *nz_h, *prio_h;
   GtkWidget *conv_c, *aff_c, *nz_c, *prio_c;
@@ -190,6 +192,8 @@ typedef struct dt_iop_colorwarp_data_t
   dt_iop_colorwarp_nodedata_t nd[CW_MAX_NODES];   // resolved, process-ready nodes
   float smoothing;       // spatial mask smoothing amount [0,1] (global)
   float edge_eps;        // guided-filter sqrt_eps (edge sensitivity) (global)
+  int use_eigf;          // mask filter: 0=guided (image), 1=EIGF (exposure-independent) (global)
+  float eigf_feather;    // EIGF feathering, derived from the edge slider (global)
 } dt_iop_colorwarp_data_t;
 
 
@@ -368,8 +372,19 @@ void process(dt_iop_module_t *self,
     const float *restrict selbuf = mask;
     if(d->smoothing > 0.f && gw >= 1)
     {
-      guided_filter(ivoid, mask, mask_f, W, H, 4, gw, d->edge_eps, 1.0f, 0.0f, 1.0f);
-      selbuf = mask_f;
+      if(d->use_eigf)
+      {
+        // exposure-independent, self-guided: smooths the mask by its own structure,
+        // avoiding the noisy scene-linear RGB guide (in-place on mask)
+        fast_eigf_surface_blur(mask, W, H, (float)gw, d->eigf_feather, 1,
+                               DT_GF_BLENDING_LINEAR, 1.0f, 0.0f, exp2f(-14.0f), 4.0f);
+        selbuf = mask;
+      }
+      else
+      {
+        guided_filter(ivoid, mask, mask_f, W, H, 4, gw, d->edge_eps, 1.0f, 0.0f, 1.0f);
+        selbuf = mask_f;
+      }
     }
 
     const float conv = nd->convergence, affinity = nd->affinity, neutral = nd->neutral_zone, prio = nd->priority;
@@ -545,6 +560,9 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
 
   d->smoothing = p->smoothing;
   d->edge_eps = fmaxf(p->edge * p->edge * 0.3f, 1e-4f);
+  d->use_eigf = p->use_eigf ? 1 : 0;
+  // EIGF feathering: high edge slider = preserve edges (low feathering), low = smooth across
+  d->eigf_feather = CLAMP(powf(10.0f, (0.5f - p->edge) * 3.0f), 0.02f, 100.0f);
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -1389,6 +1407,13 @@ void gui_init(dt_iop_module_t *self)
                                          "low: hug even faint edges (crisp selection, but\n"
                                          "speckle may survive near edges).\n"
                                          "high: smooth across edges (toward a plain blur, halos)."));
+
+  g->use_eigf = dt_bauhaus_toggle_from_params(self, "use_eigf");
+  gtk_widget_set_tooltip_text(g->use_eigf, _("exposure-independent guided filter for the mask.\n"
+                                             "the default guided filter uses the scene-linear image\n"
+                                             "as a guide, which is noisy in shadows; this variant is\n"
+                                             "self-guided and behaves consistently from shadows to\n"
+                                             "highlights. try it when low-chroma shadows stay noisy."));
 
   // start on the affinity page that matches the saved mode
   gtk_notebook_set_current_page(g->aff_notebook,
