@@ -148,6 +148,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *node_combo, *node_add, *node_remove;  // node selector
   int mode;               // 0=hue/sat (wheel), 1=hue/light (wheel), 2=sat/light (panel)
   int mask_mode;          // 0=off, 1=correction intensity, 2=selection (darkroom preview only)
+  int view_all;           // "all nodes" preview: mask spans every node (union), not just active
   int drag;               // 0=none, 1=source, 2=target
 } dt_iop_colorwarp_gui_data_t;
 
@@ -283,6 +284,7 @@ void process(dt_iop_module_t *self,
   // mask display is a darkroom-preview-only GUI state (never thumbnails/export)
   const dt_iop_colorwarp_gui_data_t *const gd = self->gui_data;
   const int mask_mode = (gd && dt_pipe_is_full(piece->pipe)) ? gd->mask_mode : 0;
+  const int mask_all = (gd && gd->view_all) ? 1 : 0;   // "all nodes": mask spans every node
 
   gboolean any = FALSE;
   for(int n = 0; n < d->num_nodes; n++) if(d->nd[n].strength > 0.f) any = TRUE;
@@ -321,7 +323,7 @@ void process(dt_iop_module_t *self,
   for(int n = 0; n < d->num_nodes; n++)
   {
     const dt_iop_colorwarp_nodedata_t *const nd = &d->nd[n];
-    if(mask_mode != 0 && n != d->active_node) continue;   // a mask preview isolates the active node
+    if(mask_mode != 0 && !mask_all && n != d->active_node) continue;   // isolate active node, unless "all nodes"
     if(nd->strength <= 0.f && mask_mode != 2) continue;   // inactive nodes add no move (selection still shown)
 
     const float hc = nd->hc;
@@ -665,6 +667,22 @@ static void _cw_tgt_ab(int mode, const dt_iop_colorwarp_params_t *p, double *a, 
   else { *a = CLAMP(p->select_sat + p->shift_chroma, 0.0, 1.0); *b = CLAMP(p->select_light + p->shift_lightness, 0.0, 1.0); }
 }
 
+static void _cw_switch_node(dt_iop_module_t *self, int newnode);
+
+// same as _cw_src_ab/_cw_tgt_ab but reading a stored node (used to draw the inactive nodes)
+static void _cw_node_src_ab(int mode, const dt_iop_colorwarp_node_t *n, double *a, double *b)
+{
+  if(mode == 0) { *a = n->center_hue; *b = n->select_sat; }
+  else if(mode == 1) { *a = n->center_hue; *b = n->select_light; }
+  else { *a = n->select_sat; *b = n->select_light; }
+}
+static void _cw_node_tgt_ab(int mode, const dt_iop_colorwarp_node_t *n, double *a, double *b)
+{
+  if(mode == 0) { *a = n->center_hue + n->shift_hue; *b = CLAMP(n->select_sat + n->shift_chroma, 0.0, 1.0); }
+  else if(mode == 1) { *a = n->center_hue + n->shift_hue; *b = CLAMP(n->select_light + n->shift_lightness, 0.0, 1.0); }
+  else { *a = CLAMP(n->select_sat + n->shift_chroma, 0.0, 1.0); *b = CLAMP(n->select_light + n->shift_lightness, 0.0, 1.0); }
+}
+
 static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
@@ -766,6 +784,21 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
   }
   cairo_set_dash(cr, NULL, 0, 0);
 
+  // other nodes: small dim source dots + faint move vector, so the whole field is visible
+  const int nn = CLAMP(p->num_nodes, 1, CW_MAX_NODES);
+  for(int i = 0; i < nn; i++)
+  {
+    if(i == p->active_node) continue;
+    double na, nb, nx, ny, mta, mtb, mtx, mty;
+    _cw_node_src_ab(mode, &p->node[i], &na, &nb); _cw_ab_pt(mode, na, nb, cx, cy, R, &nx, &ny);
+    _cw_node_tgt_ab(mode, &p->node[i], &mta, &mtb); _cw_ab_pt(mode, mta, mtb, cx, cy, R, &mtx, &mty);
+    cairo_move_to(cr, nx, ny); cairo_line_to(cr, mtx, mty);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.35); cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0)); cairo_stroke(cr);
+    cairo_arc(cr, nx, ny, DT_PIXEL_APPLY_DPI(3.0), 0, 2.0 * M_PI);
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.55); cairo_fill_preserve(cr);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.6); cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0)); cairo_stroke(cr);
+  }
+
   cairo_move_to(cr, sx, sy); cairo_line_to(cr, tx, ty);
   cairo_set_source_rgb(cr, 1, 1, 1); cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5)); cairo_stroke(cr);
   cairo_arc(cr, sx, sy, DT_PIXEL_APPLY_DPI(4.0), 0, 2.0 * M_PI); cairo_set_source_rgb(cr, 1, 1, 1); cairo_fill_preserve(cr);
@@ -862,7 +895,19 @@ static gboolean _cw_press(GtkWidget *widget, GdkEventButton *e, dt_iop_module_t 
   g->drag = 0;
   if(hypot(e->x - tx, e->y - ty) < eps) g->drag = 2;                 // grab target
   else if(hypot(e->x - sx, e->y - sy) < eps) g->drag = 1;            // grab source
-  else { g->drag = 1; _cw_set_from_xy(self, e->x, e->y, 1); }        // click empty -> move source
+  if(!g->drag)
+  {
+    // click near another node's source dot -> select that node
+    const int nn = CLAMP(p->num_nodes, 1, CW_MAX_NODES);
+    for(int i = 0; i < nn; i++)
+    {
+      if(i == p->active_node) continue;
+      double na, nb, nx, ny;
+      _cw_node_src_ab(g->mode, &p->node[i], &na, &nb); _cw_ab_pt(g->mode, na, nb, cx, cy, R, &nx, &ny);
+      if(hypot(e->x - nx, e->y - ny) < eps) { _cw_switch_node(self, i); return TRUE; }
+    }
+    g->drag = 1; _cw_set_from_xy(self, e->x, e->y, 1);               // click empty -> move source
+  }
   return TRUE;
 }
 
@@ -996,6 +1041,7 @@ static void _cw_rebuild_node_combo(dt_iop_module_t *self)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
   dt_iop_colorwarp_params_t *p = self->params;
+  if(p->num_nodes <= 1) g->view_all = FALSE;   // no "all nodes" entry when a single node
   ++darktable.gui->reset;
   dt_bauhaus_combobox_clear(g->node_combo);
   for(int i = 0; i < p->num_nodes; i++)
@@ -1004,7 +1050,8 @@ static void _cw_rebuild_node_combo(dt_iop_module_t *self)
     snprintf(s, sizeof(s), _("node %d"), i + 1);
     dt_bauhaus_combobox_add(g->node_combo, s);
   }
-  dt_bauhaus_combobox_set(g->node_combo, p->active_node);
+  if(p->num_nodes > 1) dt_bauhaus_combobox_add(g->node_combo, _("all nodes"));   // mask overview
+  dt_bauhaus_combobox_set(g->node_combo, g->view_all ? p->num_nodes : p->active_node);
   --darktable.gui->reset;
 }
 
@@ -1012,11 +1059,18 @@ static void _cw_switch_node(dt_iop_module_t *self, int newnode)
 {
   dt_iop_colorwarp_params_t *p = self->params;
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  g->view_all = FALSE;
   newnode = CLAMP(newnode, 0, p->num_nodes - 1);
   _cw_scratch_node(p, &p->node[p->active_node]);   // save the current edits into the array
   p->active_node = newnode;
   _cw_node_to_flat(p, &p->node[newnode]);           // load the new node into the editor
   _cw_sync_sliders(self);
+  if(g->node_combo)
+  {
+    ++darktable.gui->reset;
+    dt_bauhaus_combobox_set(g->node_combo, newnode);
+    --darktable.gui->reset;
+  }
   if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
@@ -1025,16 +1079,24 @@ static void _cw_node_combo_changed(GtkWidget *w, dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  dt_iop_colorwarp_params_t *p = self->params;
   const int sel = dt_bauhaus_combobox_get(w);
-  if(sel != ((dt_iop_colorwarp_params_t *)self->params)->active_node)
-    _cw_switch_node(self, sel);
-  (void)g;
+  if(sel >= p->num_nodes)   // "all nodes" overview: mask spans every node, keep editing the active one
+  {
+    g->view_all = TRUE;
+    dt_dev_reprocess_center(darktable.develop);
+    return;
+  }
+  g->view_all = FALSE;
+  if(sel != p->active_node) _cw_switch_node(self, sel);
+  else dt_dev_reprocess_center(darktable.develop);
 }
 
 static void _cw_node_add(GtkWidget *w, dt_iop_module_t *self)
 {
   dt_iop_colorwarp_params_t *p = self->params;
   if(p->num_nodes >= CW_MAX_NODES) return;
+  ((dt_iop_colorwarp_gui_data_t *)self->gui_data)->view_all = FALSE;
   _cw_scratch_node(p, &p->node[p->active_node]);
   _cw_default_node(&p->node[p->num_nodes]);
   p->active_node = p->num_nodes;
