@@ -130,6 +130,7 @@ const dt_iop_order_entry_t legacy_order[] = {
   { {33.5f }, "colorbalancergb", 0},
   { {33.6f }, "coloruniformity", 0},
   { {33.7f }, "coloruniformityv2", 0},
+  { {33.8f }, "colorwarp", 0},
   { {34.0f }, "colorize", 0},
   { {35.0f }, "colortransfer", 0},
   { {36.0f }, "colormapping", 0},
@@ -254,6 +255,7 @@ const dt_iop_order_entry_t v30_order[] = {
   { {41.5f }, "colorbalancergb", 0},    // scene-referred color manipulation
   { {41.6f }, "coloruniformity", 0},
   { {41.7f }, "coloruniformityv2", 0},
+  { {41.8f }, "colorwarp", 0},
   { {42.0f }, "rgbcurve", 0},        // really versatile way to edit colour in scene-referred and display-referred workflow
   { {43.0f }, "rgblevels", 0},       // same
   { {44.0f }, "basecurve", 0},       // conversion from scene-referred to display referred, reverse-engineered
@@ -375,6 +377,7 @@ const dt_iop_order_entry_t v50_order[] = {
   { {41.5f }, "colorbalancergb", 0},    // scene-referred color manipulation
   { {41.6f }, "coloruniformity", 0},
   { {41.7f }, "coloruniformityv2", 0},
+  { {41.8f }, "colorwarp", 0},
   { {42.0f }, "rgbcurve", 0},        // really versatile way to edit colour in scene-referred and display-referred workflow
   { {43.0f }, "rgblevels", 0},       // same
   { {44.0f }, "basecurve", 0},       // conversion from scene-referred to display referred, reverse-engineered
@@ -496,6 +499,7 @@ const dt_iop_order_entry_t v30_jpg_order[] = {
   { { 41.5f }, "colorbalancergb", 0 }, // scene-referred color manipulation
   { { 41.6f }, "coloruniformity", 0 },
   { { 41.7f }, "coloruniformityv2", 0 },
+  { { 41.8f }, "colorwarp", 0 },
   { { 42.0f }, "rgbcurve", 0 },      // really versatile way to edit colour in scene-referred and display-referred
                                      // workflow
   { { 43.0f }, "rgblevels", 0 },     // same
@@ -620,6 +624,7 @@ const dt_iop_order_entry_t v50_jpg_order[] = {
   { { 41.5f }, "colorbalancergb", 0 }, // scene-referred color manipulation
   { { 41.6f }, "coloruniformity", 0 },
   { { 41.7f }, "coloruniformityv2", 0 },
+  { { 41.8f }, "colorwarp", 0 },
   { { 42.0f }, "rgbcurve", 0 },      // really versatile way to edit colour in scene-referred and display-referred
                                      // workflow
   { { 43.0f }, "rgblevels", 0 },     // same
@@ -739,6 +744,7 @@ void dt_ioppr_migrate_legacy_iop_order_list(GList *iop_order_list)
   _insert_before(iop_order_list, "rgbcurve", "colorbalancergb");
   _insert_before(iop_order_list, "rgbcurve", "coloruniformity");
   _insert_before(iop_order_list, "rgbcurve", "coloruniformityv2");
+  _insert_before(iop_order_list, "rgbcurve", "colorwarp");
   _insert_before(iop_order_list, "ashift", "cacorrectrgb");
   _insert_before(iop_order_list, "graduatednd", "crop");
   _insert_before(iop_order_list, "flip", "enlargecanvas");
