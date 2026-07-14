@@ -570,15 +570,16 @@ static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_
 {
   nd->strength = n->strength;
   nd->hc = n->center_hue * (2.0f * M_PI_F) - M_PI_F;   // [0,1] -> [-pi,pi]
-  // each axis: a flat plateau of half-width range*span (range=1 -> covers the whole
-  // axis, weight 1 everywhere), plus a Gaussian shoulder of width feather*span/2 beyond
-  // it. feather=0 -> hard-edged band; higher -> softer edge. span = max axis distance.
+  // each axis: a flat plateau of half-width range*span (range=1 -> covers the whole axis,
+  // weight 1 everywhere; range=0 -> nothing), plus a Gaussian shoulder whose width is a
+  // fraction of the PLATEAU (feather*hw/2) so a tight range stays tight regardless of
+  // feather. feather=0 -> hard edge. span = max axis distance.
   const float f = CLAMP(n->feather, 0.0f, 1.0f);
-  nd->hw_h = n->reach * M_PI_F;            nd->sigma_h = fmaxf(f * M_PI_F * 0.5f, 1e-3f);
+  nd->hw_h = n->reach * M_PI_F;            nd->sigma_h = fmaxf(f * nd->hw_h * 0.5f, 1e-3f);
   nd->sat_center = n->select_sat * n->select_sat * 0.1f;
-  nd->hw_s = n->sat_range * 0.3f;          nd->sat_sigma = fmaxf(f * 0.3f * 0.5f, 1e-4f);
+  nd->hw_s = n->sat_range * 0.3f;          nd->sat_sigma = fmaxf(f * nd->hw_s * 0.5f, 1e-4f);
   nd->light_center = n->select_light;
-  nd->hw_l = n->light_range * 1.5f;        nd->light_sigma = fmaxf(f * 1.5f * 0.5f, 0.02f);
+  nd->hw_l = n->light_range * 1.5f;        nd->light_sigma = fmaxf(f * nd->hw_l * 0.5f, 0.02f);
   // neutral protection now fully user-controlled: 0 = off (can select even neutrals)
   const float guard = CLAMP(n->neutral_protect, 0.0f, 1.0f) * 0.06f;
   nd->guard2 = guard * guard;
