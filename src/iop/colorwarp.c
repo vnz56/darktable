@@ -145,6 +145,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *mode_combo;  // which 2 axes the canvas shows
   GtkWidget *fine_toggle; // reveal the axis sliders already on the canvas
   GtkWidget *mask_combo;  // show mask: off / correction / selection
+  GtkWidget *node_combo, *node_add, *node_remove;  // node selector
   int mode;               // 0=hue/sat (wheel), 1=hue/light (wheel), 2=sat/light (panel)
   int mask_mode;          // 0=off, 1=correction intensity, 2=selection (darkroom preview only)
   int drag;               // 0=none, 1=source, 2=target
@@ -930,6 +931,141 @@ static void _cw_aff_page(GtkNotebook *nb, GtkWidget *page, guint page_num, dt_io
   }
 }
 
+// ---- multi-node management (the flat fields are the live editor for the active node) ----
+static void _cw_default_node(dt_iop_colorwarp_node_t *n)
+{
+  memset(n, 0, sizeof(*n));
+  n->strength = 1.0f;
+  n->center_hue = 0.5f; n->reach = 1.0f;
+  n->select_sat = 0.5f; n->sat_range = 1.0f;
+  n->select_light = 0.5f; n->light_range = 1.0f;
+}
+
+// copy a node struct into the flat editor fields
+static void _cw_node_to_flat(dt_iop_colorwarp_params_t *p, const dt_iop_colorwarp_node_t *n)
+{
+  p->strength = n->strength; p->center_hue = n->center_hue; p->reach = n->reach;
+  p->select_sat = n->select_sat; p->sat_range = n->sat_range;
+  p->select_light = n->select_light; p->light_range = n->light_range;
+  p->invert = n->invert; p->shift_hue = n->shift_hue; p->shift_chroma = n->shift_chroma;
+  p->shift_lightness = n->shift_lightness; p->convergence = n->convergence; p->affinity = n->affinity;
+  p->neutral_zone = n->neutral_zone; p->priority = n->priority; p->per_component = n->per_component;
+  p->conv_h = n->conv_h; p->aff_h = n->aff_h; p->nz_h = n->nz_h; p->prio_h = n->prio_h;
+  p->conv_c = n->conv_c; p->aff_c = n->aff_c; p->nz_c = n->nz_c; p->prio_c = n->prio_c;
+  p->conv_l = n->conv_l; p->aff_l = n->aff_l; p->nz_l = n->nz_l; p->prio_l = n->prio_l;
+  p->absolute_target = n->absolute_target;
+}
+
+// push the flat editor fields into the widgets (callbacks suppressed)
+static void _cw_sync_sliders(dt_iop_module_t *self)
+{
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  dt_iop_colorwarp_params_t *p = self->params;
+  ++darktable.gui->reset;
+  dt_bauhaus_slider_set(g->strength, p->strength);
+  dt_bauhaus_slider_set(g->center_hue, p->center_hue);
+  dt_bauhaus_slider_set(g->reach, p->reach);
+  dt_bauhaus_slider_set(g->select_sat, p->select_sat);
+  dt_bauhaus_slider_set(g->sat_range, p->sat_range);
+  dt_bauhaus_slider_set(g->select_light, p->select_light);
+  dt_bauhaus_slider_set(g->light_range, p->light_range);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->invert), p->invert);
+  dt_bauhaus_slider_set(g->shift_hue, p->shift_hue);
+  dt_bauhaus_slider_set(g->shift_chroma, p->shift_chroma);
+  dt_bauhaus_slider_set(g->shift_lightness, p->shift_lightness);
+  dt_bauhaus_slider_set(g->convergence, p->convergence);
+  dt_bauhaus_slider_set(g->affinity, p->affinity);
+  dt_bauhaus_slider_set(g->neutral_zone, p->neutral_zone);
+  dt_bauhaus_slider_set(g->priority, p->priority);
+  dt_bauhaus_slider_set(g->conv_h, p->conv_h); dt_bauhaus_slider_set(g->aff_h, p->aff_h);
+  dt_bauhaus_slider_set(g->nz_h, p->nz_h); dt_bauhaus_slider_set(g->prio_h, p->prio_h);
+  dt_bauhaus_slider_set(g->conv_c, p->conv_c); dt_bauhaus_slider_set(g->aff_c, p->aff_c);
+  dt_bauhaus_slider_set(g->nz_c, p->nz_c); dt_bauhaus_slider_set(g->prio_c, p->prio_c);
+  dt_bauhaus_slider_set(g->conv_l, p->conv_l); dt_bauhaus_slider_set(g->aff_l, p->aff_l);
+  dt_bauhaus_slider_set(g->nz_l, p->nz_l); dt_bauhaus_slider_set(g->prio_l, p->prio_l);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->absolute_target), p->absolute_target);
+  gtk_notebook_set_current_page(g->aff_notebook, p->per_component ? 1 : 0);
+  --darktable.gui->reset;
+}
+
+static void _cw_rebuild_node_combo(dt_iop_module_t *self)
+{
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  dt_iop_colorwarp_params_t *p = self->params;
+  ++darktable.gui->reset;
+  dt_bauhaus_combobox_clear(g->node_combo);
+  for(int i = 0; i < p->num_nodes; i++)
+  {
+    char s[24];
+    snprintf(s, sizeof(s), _("node %d"), i + 1);
+    dt_bauhaus_combobox_add(g->node_combo, s);
+  }
+  dt_bauhaus_combobox_set(g->node_combo, p->active_node);
+  --darktable.gui->reset;
+}
+
+static void _cw_switch_node(dt_iop_module_t *self, int newnode)
+{
+  dt_iop_colorwarp_params_t *p = self->params;
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  newnode = CLAMP(newnode, 0, p->num_nodes - 1);
+  _cw_scratch_node(p, &p->node[p->active_node]);   // save the current edits into the array
+  p->active_node = newnode;
+  _cw_node_to_flat(p, &p->node[newnode]);           // load the new node into the editor
+  _cw_sync_sliders(self);
+  if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+static void _cw_node_combo_changed(GtkWidget *w, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  const int sel = dt_bauhaus_combobox_get(w);
+  if(sel != ((dt_iop_colorwarp_params_t *)self->params)->active_node)
+    _cw_switch_node(self, sel);
+  (void)g;
+}
+
+static void _cw_node_add(GtkWidget *w, dt_iop_module_t *self)
+{
+  dt_iop_colorwarp_params_t *p = self->params;
+  if(p->num_nodes >= CW_MAX_NODES) return;
+  _cw_scratch_node(p, &p->node[p->active_node]);
+  _cw_default_node(&p->node[p->num_nodes]);
+  p->active_node = p->num_nodes;
+  p->num_nodes++;
+  _cw_node_to_flat(p, &p->node[p->active_node]);
+  _cw_sync_sliders(self);
+  _cw_rebuild_node_combo(self);
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+static void _cw_node_remove(GtkWidget *w, dt_iop_module_t *self)
+{
+  dt_iop_colorwarp_params_t *p = self->params;
+  if(p->num_nodes <= 1) return;
+  for(int i = p->active_node; i < p->num_nodes - 1; i++) p->node[i] = p->node[i + 1];
+  p->num_nodes--;
+  p->active_node = CLAMP(p->active_node, 0, p->num_nodes - 1);
+  _cw_node_to_flat(p, &p->node[p->active_node]);
+  _cw_sync_sliders(self);
+  _cw_rebuild_node_combo(self);
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+void gui_update(dt_iop_module_t *self)
+{
+  _cw_sync_sliders(self);
+  _cw_rebuild_node_combo(self);
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  if(g && g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+}
+
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
@@ -1026,6 +1162,22 @@ void gui_init(dt_iop_module_t *self)
                                 "never affects thumbnails or export."));
   g_signal_connect(G_OBJECT(g->mask_combo), "value-changed", G_CALLBACK(_cw_mask_changed), self);
   gtk_box_pack_start(GTK_BOX(self->widget), g->mask_combo, FALSE, FALSE, 0);
+
+  // node selector: the panel below edits the chosen attractor; all nodes act together (field)
+  g->node_combo = dt_bauhaus_combobox_new(self);
+  dt_bauhaus_widget_set_label(g->node_combo, NULL, N_("node"));
+  gtk_widget_set_tooltip_text(g->node_combo, _("which attractor node the panel below edits.\n"
+                                              "all nodes act together as one smooth field."));
+  g_signal_connect(G_OBJECT(g->node_combo), "value-changed", G_CALLBACK(_cw_node_combo_changed), self);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->node_combo, FALSE, FALSE, 0);
+  g->node_add = gtk_button_new_with_label(_("+ add node"));
+  g_signal_connect(G_OBJECT(g->node_add), "clicked", G_CALLBACK(_cw_node_add), self);
+  g->node_remove = gtk_button_new_with_label(_("− remove node"));
+  g_signal_connect(G_OBJECT(g->node_remove), "clicked", G_CALLBACK(_cw_node_remove), self);
+  GtkWidget *nrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_BAUHAUS_SPACE);
+  gtk_box_pack_start(GTK_BOX(nrow), g->node_add, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(nrow), g->node_remove, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(self->widget), nrow, FALSE, FALSE, 0);
 
   // master dose on top: it multiplies the whole H/S/L move below.
   g->strength = dt_bauhaus_slider_from_params(self, "strength");
@@ -1142,6 +1294,7 @@ void gui_init(dt_iop_module_t *self)
   // start on the affinity page that matches the saved mode
   gtk_notebook_set_current_page(g->aff_notebook,
                                 ((dt_iop_colorwarp_params_t *)self->params)->per_component ? 1 : 0);
+  _cw_rebuild_node_combo(self);
 
   // the 9 axis sliders are shown/hidden per canvas view -> keep show_all from forcing them
   GtkWidget *managed[] = { g->center_hue, g->reach, g->shift_hue,
