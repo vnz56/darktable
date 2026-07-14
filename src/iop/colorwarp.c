@@ -368,25 +368,30 @@ void process(dt_iop_module_t *self,
       const float light_w = _cw_band_w(fabsf(J - light_center), hw_l, inv_2sl2);
       float sel = hue_w * sat_w * light_w;
       if(invert) sel = 1.0f - sel;
-      mask[k] = sel * (sat * sat) / (sat * sat + guard2);
+      // neutral protection: fade near-neutral pixels (noisy hue); guard2==0 -> off
+      mask[k] = (guard2 > 0.0f) ? sel * (sat * sat) / (sat * sat + guard2) : sel;
     }
 
     const float *restrict selbuf = mask;
     if(d->smoothing > 0.f && gw >= 1)
     {
+      float *restrict fb;
       if(d->use_eigf)
       {
-        // exposure-independent, self-guided: smooths the mask by its own structure,
-        // avoiding the noisy scene-linear RGB guide (in-place on mask)
+        // exposure-independent, self-guided (in-place on mask)
         fast_eigf_surface_blur(mask, W, H, (float)gw, d->eigf_feather, 1,
                                DT_GF_BLENDING_LINEAR, 1.0f, 0.0f, exp2f(-14.0f), 4.0f);
-        selbuf = mask;
+        fb = mask;
       }
       else
       {
         guided_filter(ivoid, mask, mask_f, W, H, 4, gw, d->edge_eps, 1.0f, 0.0f, 1.0f);
-        selbuf = mask_f;
+        fb = mask_f;
       }
+      // both filters can overshoot; a mask must stay in [0,1] (negatives -> black speckle)
+      DT_OMP_FOR()
+      for(size_t k = 0; k < npixels; k++) fb[k] = CLAMP(fb[k], 0.0f, 1.0f);
+      selbuf = fb;
     }
 
     const float conv = nd->convergence, affinity = nd->affinity, neutral = nd->neutral_zone, prio = nd->priority;
@@ -513,18 +518,17 @@ static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_
 {
   nd->strength = n->strength;
   nd->hc = n->center_hue * (2.0f * M_PI_F) - M_PI_F;   // [0,1] -> [-pi,pi]
-  // each axis: split its footprint into a flat plateau + a Gaussian shoulder.
-  // feather=1 -> pure Gaussian (legacy look); feather=0 -> hard top-hat band.
+  // each axis: a flat plateau of half-width range*span (range=1 -> covers the whole
+  // axis, weight 1 everywhere), plus a Gaussian shoulder of width feather*span/2 beyond
+  // it. feather=0 -> hard-edged band; higher -> softer edge. span = max axis distance.
   const float f = CLAMP(n->feather, 0.0f, 1.0f);
-  const float base_h = fmaxf(n->reach * M_PI_F, 1e-3f);
-  nd->hw_h = (1.0f - f) * base_h; nd->sigma_h = fmaxf(f * base_h, 1e-3f);
+  nd->hw_h = n->reach * M_PI_F;            nd->sigma_h = fmaxf(f * M_PI_F * 0.5f, 1e-3f);
   nd->sat_center = n->select_sat * n->select_sat * 0.1f;
-  const float base_s = fmaxf(n->sat_range * 0.3f, 1e-4f);
-  nd->hw_s = (1.0f - f) * base_s; nd->sat_sigma = fmaxf(f * base_s, 1e-4f);
+  nd->hw_s = n->sat_range * 0.3f;          nd->sat_sigma = fmaxf(f * 0.3f * 0.5f, 1e-4f);
   nd->light_center = n->select_light;
-  const float base_l = fmaxf(n->light_range * 3.0f, 0.02f);
-  nd->hw_l = (1.0f - f) * base_l; nd->light_sigma = fmaxf(f * base_l, 0.02f);
-  const float guard = 0.003f + CLAMP(n->neutral_protect, 0.0f, 1.0f) * 0.06f;
+  nd->hw_l = n->light_range * 1.5f;        nd->light_sigma = fmaxf(f * 1.5f * 0.5f, 0.02f);
+  // neutral protection now fully user-controlled: 0 = off (can select even neutrals)
+  const float guard = CLAMP(n->neutral_protect, 0.0f, 1.0f) * 0.06f;
   nd->guard2 = guard * guard;
   nd->invert = n->invert ? 1 : 0;
   nd->sel_hue = n->center_hue;
@@ -1347,9 +1351,10 @@ void gui_init(dt_iop_module_t *self)
                                                "max = affect all lightnesses (no restriction)."));
 
   g->feather = dt_bauhaus_slider_from_params(self, "feather");
-  gtk_widget_set_tooltip_text(g->feather, _("transition softness at the selection edges.\n"
-                                           "0 = hard-edged band (range = fully-selected zone);\n"
-                                           "1 = fully feathered (smooth Gaussian falloff, no plateau)."));
+  gtk_widget_set_tooltip_text(g->feather, _("transition softness beyond the selected band.\n"
+                                           "0 = hard edge; higher = softer Gaussian shoulder.\n"
+                                           "the 'range' sliders set the fully-selected zone\n"
+                                           "(range = max selects everything)."));
 
   g->neutral_protect = dt_bauhaus_slider_from_params(self, "neutral_protect");
   gtk_widget_set_tooltip_text(g->neutral_protect, _("fade the selection out at low chroma, where hue is noisy\n"
