@@ -499,14 +499,16 @@ void process(dt_iop_module_t *self,
       }
       else
       {
-        const float da = a_t - a_p, db = b_t - b_p, dl = t_lgt - J;
-        const float dist = sqrtf(da * da + db * db + dl * dl);
+        // convergence acts on the CHROMA plane only; lightness just translates by its shift,
+        // so tinting/uniformity keeps the tonal modelling (no flattening to one lightness).
+        const float da = a_t - a_p, db = b_t - b_p;
+        const float dist = sqrtf(da * da + db * db);
         const float w = w_base * _cw_affinity_weight(affinity, neutral, dist);
         const float wt = w * (1.0f - conv);
         const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
         acc_h[k] += wt * (a_t - a_c) + wc * da;
         acc_s[k] += wt * (b_t - b_c) + wc * db;
-        acc_l[k] += wt * (t_lgt - c_lgt) + wc * dl;
+        acc_l[k] += w * (t_lgt - c_lgt);
       }
     }
   }
