@@ -132,6 +132,7 @@ typedef struct dt_iop_colorwarp_params_t
   float smoothing;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.25 $DESCRIPTION: "smoothing"
   float edge;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.3 $DESCRIPTION: "edge threshold"
   gboolean use_eigf;      // $DEFAULT: FALSE $DESCRIPTION: "exposure-independent filter"
+  float corr_smooth;      // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "correction smoothing"
   // --- multi-node (field): the flat fields above are the live editor for node[active_node] ---
   int num_nodes;          // $MIN: 1 $MAX: 8 $DEFAULT: 1 $DESCRIPTION: "nodes"
   int active_node;        // $MIN: 0 $MAX: 7 $DEFAULT: 0
@@ -143,7 +144,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *strength, *center_hue, *reach, *select_sat, *sat_range, *select_light, *light_range, *invert;
   GtkWidget *feather, *neutral_protect;
   GtkWidget *shift_hue, *shift_chroma, *shift_lightness, *convergence, *affinity;
-  GtkWidget *neutral_zone, *priority, *absolute_target, *smoothing, *edge, *use_eigf;
+  GtkWidget *neutral_zone, *priority, *absolute_target, *smoothing, *edge, *use_eigf, *corr_smooth;
   GtkNotebook *aff_notebook;   // affinity: global + per-component pages
   GtkWidget *conv_h, *aff_h, *nz_h, *prio_h;
   GtkWidget *conv_c, *aff_c, *nz_c, *prio_c;
@@ -194,6 +195,7 @@ typedef struct dt_iop_colorwarp_data_t
   float edge_eps;        // guided-filter sqrt_eps (edge sensitivity) (global)
   int use_eigf;          // mask filter: 0=guided (image), 1=EIGF (exposure-independent) (global)
   float eigf_feather;    // EIGF feathering, derived from the edge slider (global)
+  float corr_smooth;     // spatial smoothing of the accumulated move [0,1] (global)
 } dt_iop_colorwarp_data_t;
 
 
@@ -439,6 +441,21 @@ void process(dt_iop_module_t *self,
 
   if(mask_mode) piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
 
+  // optional: edge-aware smoothing of the accumulated move, to cut the noise that the
+  // per-pixel converge / priority / affinity terms pick up in low-chroma shadows.
+  // one pass per axis on the summed field (independent of node count); mask/mask_f are free.
+  const int cw = (int)(d->corr_smooth * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
+  if(d->corr_smooth > 0.f && cw >= 1 && mask_mode == 0)
+  {
+    float *const restrict accs[3] = { acc_h, acc_s, acc_l };
+    for(int c = 0; c < 3; c++)
+    {
+      guided_filter(ivoid, accs[c], mask_f, W, H, 4, cw, d->edge_eps, 1.0f, 0.0f, 1.0f);
+      DT_OMP_FOR()
+      for(size_t k = 0; k < npixels; k++) accs[c][k] = mask_f[k];
+    }
+  }
+
   // --- apply the accumulated move (or write the grayscale mask) ---
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
@@ -563,6 +580,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   d->use_eigf = p->use_eigf ? 1 : 0;
   // EIGF feathering: high edge slider = preserve edges (low feathering), low = smooth across
   d->eigf_feather = CLAMP(powf(10.0f, (0.5f - p->edge) * 3.0f), 0.02f, 100.0f);
+  d->corr_smooth = p->corr_smooth;
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -1414,6 +1432,12 @@ void gui_init(dt_iop_module_t *self)
                                              "as a guide, which is noisy in shadows; this variant is\n"
                                              "self-guided and behaves consistently from shadows to\n"
                                              "highlights. try it when low-chroma shadows stay noisy."));
+
+  g->corr_smooth = dt_bauhaus_slider_from_params(self, "corr_smooth");
+  gtk_widget_set_tooltip_text(g->corr_smooth, _("edge-aware smoothing of the applied correction itself\n"
+                                                "(not just the selection). cuts the noise that converge,\n"
+                                                "priority and affinity pick up from per-pixel values in\n"
+                                                "low-chroma shadows. 0 = off (no extra cost)."));
 
   // start on the affinity page that matches the saved mode
   gtk_notebook_set_current_page(g->aff_notebook,
