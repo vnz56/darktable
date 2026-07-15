@@ -961,7 +961,9 @@ static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, fl
         float a = (CW_WHEEL_ROT - atan2f(dy, dx)) / (2.f * M_PI_F); a -= floorf(a);   // hue turn
         h = a * 2.f * M_PI_F - M_PI_F;
         if(mode == 0) { J = 0.72f; C = _cw_S_to_C(rr * rr * 0.1f, J); }        // sat wheel
-        else          { J = fmaxf(rr, 1e-3f); C = _cw_S_to_C(0.05f, J); }      // lightness wheel
+        // lightness wheel: chroma grows with J so saturation rises smoothly from the neutral
+        // centre (a fixed S made colorfulness jump right off the centre -> a coloured ring)
+        else          { J = fmaxf(rr, 1e-3f); C = _cw_S_to_C(0.07f * J, J); }
       }
       float rgb[3];
       _cw_jch_to_srgb(J, C, h, L_white, rgb);
