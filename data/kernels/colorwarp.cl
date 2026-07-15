@@ -26,7 +26,7 @@
 
 static inline float4 _cw_rgb_to_jch(const float4 rgb, constant const float *const M, const float L_white)
 {
-  const float4 XYZ = matrix_product(rgb, M);
+  const float4 XYZ = matrix_product_float4(rgb, M);
   const float4 xyY = dt_D65_XYZ_to_xyY(XYZ);
   const float Ls = Y_to_dt_UCS_L_star(xyY.z);
   const float2 UV = xyY_to_dt_UCS_UV(xyY);
@@ -262,7 +262,7 @@ kernel void colorwarp_apply(read_only image2d_t in, write_only image2d_t out,
   const float4 JCH2 = (float4)(J2, C2, h2, 0.0f);
   const float4 xyY = dt_UCS_JCH_to_xyY(JCH2, L_white);
   const float4 XYZ = dt_xyY_to_XYZ(xyY);
-  float4 outv = matrix_product(XYZ, Mout);
+  float4 outv = matrix_product_float4(XYZ, Mout);
   outv.w = rgb.w;
   write_imagef(out, (int2)(x, y), outv);
 }
