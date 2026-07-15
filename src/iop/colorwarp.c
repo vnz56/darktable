@@ -237,6 +237,7 @@ typedef struct dt_iop_colorwarp_data_t
 typedef struct dt_iop_colorwarp_global_data_t
 {
   int kernel_clear, kernel_build_mask, kernel_accumulate, kernel_apply;
+  int kernel_blend_to_buffer, kernel_sel_accumulate;
 } dt_iop_colorwarp_global_data_t;
 
 
@@ -768,19 +769,28 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 
   const dt_iop_colorwarp_gui_data_t *const g = self->gui_data;
   const int mask_mode = (g && dt_pipe_is_full(piece->pipe)) ? g->mask_mode : 0;
-  // phase 1: only the core grading path on GPU; the rest falls back to CPU
-  if(mask_mode != 0 || d->use_eigf || d->input_smooth > 0.f || d->corr_smooth > 0.f)
+  const int mask_all = (g && g->view_all) ? 1 : 0;   // "all nodes" preview: union over every node
+  const int active_node = d->active_node;            // node the mask preview isolates
+  // GPU handles the full grading path incl. correction smoothing and the mask previews; only the
+  // EIGF selection filter (no CL version) still falls back to CPU.
+  if(d->use_eigf)
   {
-    dt_print(DT_DEBUG_OPENCL, "[colorwarp] CPU fallback (phase 1): mask_mode=%d eigf=%d input_smooth=%.2f corr_smooth=%.2f\n",
-             mask_mode, d->use_eigf, d->input_smooth, d->corr_smooth);
+    dt_print(DT_DEBUG_OPENCL, "[colorwarp] CPU fallback: eigf=%d\n", d->use_eigf);
     return DT_OPENCL_PROCESS_CL;
   }
+  // a grayscale mask preview must bypass the display colour management, like the CPU path
+  if(mask_mode) piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
 
   const int devid = piece->pipe->devid;
   const int width = roi_out->width, height = roi_out->height;
   const float L_white = Y_to_dt_UCS_L_star(1.0f);
   const int polar = d->polar_move;
-  const int gw = (int)(d->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
+  const float pxscale = fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale);
+  const int gw = (int)(d->smoothing * pxscale + 0.5f);
+  // correction-smoothing radius: min 1 once active; fine control is a continuous raw->smoothed blend
+  const int cw = MAX(1, (int)(d->corr_smooth * pxscale + 0.5f));
+  const float cblend = CLAMP(d->corr_smooth, 0.0f, 1.0f);
+  const size_t region[2] = { (size_t)width, (size_t)height };
 
   cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
 
@@ -795,25 +805,38 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   cl_mem acc_h = dt_opencl_alloc_device_buffer(devid, bsize);
   cl_mem acc_s = dt_opencl_alloc_device_buffer(devid, bsize);
   cl_mem acc_l = dt_opencl_alloc_device_buffer(devid, bsize);
+  cl_mem sel_acc = (mask_mode == 2) ? dt_opencl_alloc_device_buffer(devid, bsize) : NULL;
   cl_mem P_cl = NULL;
+  cl_mem sel_arg = NULL;   // sel_acc for mask_mode 2, else a dummy (set before apply)
 
-  if(!in_m || !out_m || !mask || !mask_f || !acc_h || !acc_s || !acc_l) goto cleanup;
+  if(!in_m || !out_m || !mask || !mask_f || !acc_h || !acc_s || !acc_l
+     || (mask_mode == 2 && !sel_acc)) goto cleanup;
 
   err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_clear, width, height,
         CLARG(acc_h), CLARG(acc_s), CLARG(acc_l), CLARG(width), CLARG(height));
   if(err != CL_SUCCESS) goto cleanup;
+  if(sel_acc)   // clear sel_acc by writing zero to it three times (reuse the 3-buffer clear kernel)
+  {
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_clear, width, height,
+          CLARG(sel_acc), CLARG(sel_acc), CLARG(sel_acc), CLARG(width), CLARG(height));
+    if(err != CL_SUCCESS) goto cleanup;
+  }
 
   for(int n = 0; n < d->num_nodes; n++)
   {
     const dt_iop_colorwarp_nodedata_t *const nd = &d->nd[n];
-    if(nd->strength <= 0.f) continue;
+    // mask previews isolate the active node (unless "all nodes"); the selection preview still
+    // shows inactive (strength 0) nodes, the correction preview and the real render do not.
+    if(mask_mode != 0 && !mask_all && n != active_node) continue;
+    if(nd->strength <= 0.f && mask_mode != 2) continue;
     float P[42];
     _cw_pack_node(nd, P);
     P_cl = dt_opencl_copy_host_to_device_constant(devid, 42 * sizeof(float), P);
     if(!P_cl) { err = CL_MEM_OBJECT_ALLOCATION_FAILURE; goto cleanup; }
 
     err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_build_mask, width, height,
-          CLARG(dev_in), CLARG(mask), CLARG(P_cl), CLARG(in_m), CLARG(L_white), CLARG(width), CLARG(height));
+          CLARG(dev_in), CLARG(mask), CLARG(P_cl), CLARG(in_m), CLARG(L_white),
+          CLARG(width), CLARG(height));
     if(err != CL_SUCCESS) goto cleanup;
 
     cl_mem selbuf = mask;
@@ -824,16 +847,46 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
       selbuf = mask_f;
     }
 
-    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_accumulate, width, height,
-          CLARG(dev_in), CLARG(selbuf), CLARG(acc_h), CLARG(acc_s), CLARG(acc_l),
-          CLARG(P_cl), CLARG(in_m), CLARG(L_white), CLARG(polar), CLARG(width), CLARG(height));
+    if(mask_mode == 2)   // selection preview: union (max) of the smoothed selections
+    {
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_sel_accumulate, width, height,
+            CLARG(selbuf), CLARG(sel_acc), CLARG(width), CLARG(height));
+    }
+    else                 // real render / correction preview: accumulate the move field
+    {
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_accumulate, width, height,
+            CLARG(dev_in), CLARG(selbuf), CLARG(acc_h), CLARG(acc_s), CLARG(acc_l),
+            CLARG(P_cl), CLARG(in_m), CLARG(L_white), CLARG(polar), CLARG(width), CLARG(height));
+    }
     if(err != CL_SUCCESS) goto cleanup;
 
     dt_opencl_release_mem_object(P_cl); P_cl = NULL;
   }
 
+  // optional: edge-aware smoothing of the accumulated move (acc_* are buffers -> stage through
+  // the mask/mask_f images that the node loop no longer needs). skip for the selection preview.
+  if(d->corr_smooth > 0.f && mask_mode != 2)
+  {
+    cl_mem accs[3] = { acc_h, acc_s, acc_l };
+    for(int c = 0; c < 3; c++)
+    {
+      // raw correction -> mask, smooth -> mask_f, then blend back into the accumulator buffer
+      err = dt_opencl_enqueue_copy_buffer_to_image(devid, accs[c], mask, 0, CLIMG_ORIGIN, region);
+      if(err != CL_SUCCESS) goto cleanup;
+      // signed move deltas -> wide clamp (a [0,1] clamp would erase negative corrections)
+      err = guided_filter_cl(devid, dev_in, mask, mask_f, width, height, 4, cw, d->edge_eps, 1.0f, -1e6f, 1e6f);
+      if(err != CL_SUCCESS) goto cleanup;
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_blend_to_buffer, width, height,
+            CLARG(accs[c]), CLARG(mask_f), CLARG(cblend), CLARG(width), CLARG(height));
+      if(err != CL_SUCCESS) goto cleanup;
+    }
+  }
+
+  // sel_acc is only read for mask_mode 2; pass acc_h as a valid dummy otherwise
+  sel_arg = sel_acc ? sel_acc : acc_h;
   err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_apply, width, height,
         CLARG(dev_in), CLARG(dev_out), CLARG(acc_h), CLARG(acc_s), CLARG(acc_l),
+        CLARG(sel_arg), CLARG(mask_mode),
         CLARG(in_m), CLARG(out_m), CLARG(L_white), CLARG(polar), CLARG(width), CLARG(height));
 
 cleanup:
@@ -843,6 +896,7 @@ cleanup:
   dt_opencl_release_mem_object(acc_h);
   dt_opencl_release_mem_object(acc_s);
   dt_opencl_release_mem_object(acc_l);
+  dt_opencl_release_mem_object(sel_acc);
   dt_opencl_release_mem_object(in_m);
   dt_opencl_release_mem_object(out_m);
   return err;
@@ -857,6 +911,8 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_build_mask = dt_opencl_create_kernel(program, "colorwarp_build_mask");
   gd->kernel_accumulate = dt_opencl_create_kernel(program, "colorwarp_accumulate");
   gd->kernel_apply = dt_opencl_create_kernel(program, "colorwarp_apply");
+  gd->kernel_blend_to_buffer = dt_opencl_create_kernel(program, "colorwarp_blend_to_buffer");
+  gd->kernel_sel_accumulate = dt_opencl_create_kernel(program, "colorwarp_sel_accumulate");
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -866,6 +922,8 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_build_mask);
   dt_opencl_free_kernel(gd->kernel_accumulate);
   dt_opencl_free_kernel(gd->kernel_apply);
+  dt_opencl_free_kernel(gd->kernel_blend_to_buffer);
+  dt_opencl_free_kernel(gd->kernel_sel_accumulate);
   free(self->data);
   self->data = NULL;
 }

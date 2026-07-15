@@ -3,8 +3,8 @@
     Copyright (C) 2026 darktable developers.
 
     colorwarp OpenCL kernels — mirror of the CPU process() core path
-    (mask_mode 0, guided-filter smoothing; eigf / prefilter / correction-
-    smoothing paths fall back to CPU).
+    (mask_mode 0, guided-filter smoothing + correction smoothing; the
+    mask-preview modes and the eigf selection filter fall back to CPU).
 
     Per-node resolved parameters are passed as a flat float array P[] to avoid
     dozens of kernel arguments. Index map (must match process_cl in colorwarp.c):
@@ -96,6 +96,17 @@ static inline float _cw_axis_move(const float dtc, const float dt, const float w
   wc *= _cw_pt_factor(pt, fabs(dt));
   const float p = clamp(1.0f - prio * tanh(dt * 4.0f), 0.0f, 2.0f);
   return p * (wt * dtc + wc * dt);
+}
+
+// blend a smoothed image back into an accumulator buffer in place: io = io*(1-t) + s*t
+kernel void colorwarp_blend_to_buffer(global float *io, read_only image2d_t s, const float t,
+                                      const int width, const int height)
+{
+  const int x = get_global_id(0), y = get_global_id(1);
+  if(x >= width || y >= height) return;
+  const int k = mad24(y, width, x);
+  const float vs = read_imagef(s, samplerA, (int2)(x, y)).x;
+  io[k] = io[k] * (1.0f - t) + vs * t;
 }
 
 // zero the accumulators before the per-node loop
@@ -226,8 +237,22 @@ kernel void colorwarp_accumulate(read_only image2d_t in, read_only image2d_t sel
 }
 
 // apply the accumulated move and write the output
+// max-accumulate a node's smoothed selection into sel_acc (for the "selection" mask preview)
+kernel void colorwarp_sel_accumulate(read_only image2d_t selbuf, global float *sel_acc,
+                                     const int width, const int height)
+{
+  const int x = get_global_id(0), y = get_global_id(1);
+  if(x >= width || y >= height) return;
+  const int k = mad24(y, width, x);
+  const float s = read_imagef(selbuf, samplerA, (int2)(x, y)).x;
+  sel_acc[k] = fmax(sel_acc[k], s);
+}
+
+// apply the accumulated move (mask_mode 0), or write a grayscale mask preview:
+//   1 = correction intensity (magnitude of the move), 2 = selection (sel_acc)
 kernel void colorwarp_apply(read_only image2d_t in, write_only image2d_t out,
                             global const float *acc_h, global const float *acc_s, global const float *acc_l,
+                            global const float *sel_acc, const int mask_mode,
                             constant float *M, constant float *Mout, const float L_white,
                             const int polar_move, const int width, const int height)
 {
@@ -235,6 +260,14 @@ kernel void colorwarp_apply(read_only image2d_t in, write_only image2d_t out,
   if(x >= width || y >= height) return;
   const int k = mad24(y, width, x);
   const float4 rgb = read_imagef(in, samplerA, (int2)(x, y));
+
+  if(mask_mode == 2)
+  {
+    const float grey = clamp(sel_acc[k], 0.0f, 1.0f);
+    write_imagef(out, (int2)(x, y), (float4)(grey, grey, grey, rgb.w));
+    return;
+  }
+
   const float4 JCH = _cw_rgb_to_jch(rgb, M, L_white);
   const float J = JCH.x, C = JCH.y, hh = JCH.z;
 
@@ -247,6 +280,15 @@ kernel void colorwarp_apply(read_only image2d_t in, write_only image2d_t out,
     const float hue_o = hue_p + acc_h[k];
     const float sat_o = fmax(sat_p + acc_s[k], 0.0f);
     J2 = fmax(J + acc_l[k], 0.0f);
+    if(mask_mode == 1)
+    {
+      float dhue = hue_o - hue_p; dhue -= round(dhue);
+      const float mh = 2.0f * dhue * sat_p;
+      const float mag = sqrt(mh * mh + (sat_o - sat_p) * (sat_o - sat_p) + (J2 - J) * (J2 - J));
+      const float grey = clamp(mag * 1.5f, 0.0f, 1.0f);
+      write_imagef(out, (int2)(x, y), (float4)(grey, grey, grey, rgb.w));
+      return;
+    }
     const float S_out = sat_o * sat_o * 0.1f;
     C2 = fmax(C * (S_out / fmax(S_in, 1e-6f)), 0.0f);
     h2 = hue_o * (2.0f * M_PI_F) - M_PI_F;
@@ -256,6 +298,13 @@ kernel void colorwarp_apply(read_only image2d_t in, write_only image2d_t out,
     const float a_o = C * cos(hh) + acc_h[k];
     const float b_o = C * sin(hh) + acc_s[k];
     J2 = fmax(J + acc_l[k], 0.0f);
+    if(mask_mode == 1)
+    {
+      const float mag = sqrt(acc_h[k] * acc_h[k] + acc_s[k] * acc_s[k] + acc_l[k] * acc_l[k]);
+      const float grey = clamp(mag * 4.0f, 0.0f, 1.0f);
+      write_imagef(out, (int2)(x, y), (float4)(grey, grey, grey, rgb.w));
+      return;
+    }
     C2 = hypot(a_o, b_o);
     h2 = atan2(b_o, a_o);
   }
