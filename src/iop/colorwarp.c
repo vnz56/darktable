@@ -81,14 +81,17 @@ typedef struct dt_iop_colorwarp_node_t
   float conv_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float aff_h;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float nz_h;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float nzf_h;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
   float prio_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float conv_c;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float aff_c;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float nz_c;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float nzf_c;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
   float prio_c;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float conv_l;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float aff_l;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float nz_l;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float nzf_l;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
   float prio_l;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   int absolute_target;    // $DEFAULT: 0
 } dt_iop_colorwarp_node_t;
@@ -121,14 +124,17 @@ typedef struct dt_iop_colorwarp_params_t
   float conv_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "convergence"
   float aff_h;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "affinity"
   float nz_h;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "neutral zone"
+  float nzf_h;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5 $DESCRIPTION: "neutral fall-off"
   float prio_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "priority"
   float conv_c;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "convergence"
   float aff_c;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "affinity"
   float nz_c;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "neutral zone"
+  float nzf_c;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5 $DESCRIPTION: "neutral fall-off"
   float prio_c;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "priority"
   float conv_l;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "convergence"
   float aff_l;            // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "affinity"
   float nz_l;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "neutral zone"
+  float nzf_l;            // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5 $DESCRIPTION: "neutral fall-off"
   float prio_l;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "priority"
   gboolean absolute_target; // $DEFAULT: FALSE $DESCRIPTION: "absolute target"
   float smoothing;        // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.25 $DESCRIPTION: "smoothing"
@@ -151,9 +157,9 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *neutral_zone, *neutral_falloff, *priority, *absolute_target, *smoothing, *edge, *use_eigf, *corr_smooth, *input_smooth;
   GtkWidget *polar_move;
   GtkNotebook *aff_notebook;   // affinity: global + per-component pages
-  GtkWidget *conv_h, *aff_h, *nz_h, *prio_h;
-  GtkWidget *conv_c, *aff_c, *nz_c, *prio_c;
-  GtkWidget *conv_l, *aff_l, *nz_l, *prio_l;
+  GtkWidget *conv_h, *aff_h, *nz_h, *nzf_h, *prio_h;
+  GtkWidget *conv_c, *aff_c, *nz_c, *nzf_c, *prio_c;
+  GtkWidget *conv_l, *aff_l, *nz_l, *nzf_l, *prio_l;
   dt_gui_collapsible_section_t selection_cs, move_cs, affinity_cs, refine_cs;   // collapsible sections
   GtkDrawingArea *area;   // selection canvas
   GtkWidget *mode_combo;  // which 2 axes the canvas shows
@@ -186,9 +192,9 @@ typedef struct dt_iop_colorwarp_nodedata_t
   float neutral_falloff; // width of the transition out of the preserved core [0,1] (global)
   float priority;        // per-axis asymmetry [-1,1] (global)
   int per_component;     // use the per-axis affinity sets instead of the global one
-  float conv_h, aff_h, nz_h, prio_h;   // per-component affinity: hue
-  float conv_c, aff_c, nz_c, prio_c;   //                         saturation
-  float conv_l, aff_l, nz_l, prio_l;   //                         lightness
+  float conv_h, aff_h, nz_h, nzf_h, prio_h;   // per-component affinity: hue
+  float conv_c, aff_c, nz_c, nzf_c, prio_c;   //                         saturation
+  float conv_l, aff_l, nz_l, nzf_l, prio_l;   //                         lightness
 } dt_iop_colorwarp_nodedata_t;
 
 typedef struct dt_iop_colorwarp_data_t
@@ -501,9 +507,9 @@ void process(dt_iop_module_t *self,
 
         if(nd->per_component)
         {
-          acc_h[k] += _cw_axis_move(dct_h, dth, w_base, nd->conv_h, nd->aff_h, nd->nz_h, nfall, nd->prio_h);
-          acc_s[k] += _cw_axis_move(dct_s, dts, w_base, nd->conv_c, nd->aff_c, nd->nz_c, nfall, nd->prio_c);
-          acc_l[k] += _cw_axis_move(dct_l, dtl, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nfall, nd->prio_l);
+          acc_h[k] += _cw_axis_move(dct_h, dth, w_base, nd->conv_h, nd->aff_h, nd->nz_h, nd->nzf_h, nd->prio_h);
+          acc_s[k] += _cw_axis_move(dct_s, dts, w_base, nd->conv_c, nd->aff_c, nd->nz_c, nd->nzf_c, nd->prio_c);
+          acc_l[k] += _cw_axis_move(dct_l, dtl, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->nzf_l, nd->prio_l);
         }
         else
         {
@@ -553,12 +559,12 @@ void process(dt_iop_module_t *self,
         {
           const float da = a_t - a_p, db = b_t - b_p;
           const float distc = sqrtf(da * da + db * db);            // chroma plane uses the "saturation" set
-          const float w = w_base * _cw_affinity_weight(nd->aff_c, nd->nz_c, nfall, distc);
+          const float w = w_base * _cw_affinity_weight(nd->aff_c, nd->nz_c, nd->nzf_c, distc);
           const float wt = w * (1.0f - nd->conv_c);
           const float wc = (nd->conv_c > 0.0f) ? fminf(w * nd->conv_c, 1.0f) : w * nd->conv_c;
           acc_h[k] += wt * (a_t - a_c) + wc * da;
           acc_s[k] += wt * (b_t - b_c) + wc * db;
-          acc_l[k] += _cw_axis_move(t_lgt - c_lgt, t_lgt - J, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nfall, nd->prio_l);
+          acc_l[k] += _cw_axis_move(t_lgt - c_lgt, t_lgt - J, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->nzf_l, nd->prio_l);
         }
         else
         {
@@ -696,9 +702,9 @@ static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_
   nd->neutral_falloff = n->neutral_falloff;
   nd->priority = n->priority;
   nd->per_component = n->per_component ? 1 : 0;
-  nd->conv_h = n->conv_h; nd->aff_h = n->aff_h; nd->nz_h = n->nz_h; nd->prio_h = n->prio_h;
-  nd->conv_c = n->conv_c; nd->aff_c = n->aff_c; nd->nz_c = n->nz_c; nd->prio_c = n->prio_c;
-  nd->conv_l = n->conv_l; nd->aff_l = n->aff_l; nd->nz_l = n->nz_l; nd->prio_l = n->prio_l;
+  nd->conv_h = n->conv_h; nd->aff_h = n->aff_h; nd->nz_h = n->nz_h; nd->nzf_h = n->nzf_h; nd->prio_h = n->prio_h;
+  nd->conv_c = n->conv_c; nd->aff_c = n->aff_c; nd->nz_c = n->nz_c; nd->nzf_c = n->nzf_c; nd->prio_c = n->prio_c;
+  nd->conv_l = n->conv_l; nd->aff_l = n->aff_l; nd->nz_l = n->nz_l; nd->nzf_l = n->nzf_l; nd->prio_l = n->prio_l;
 }
 
 // copy the flat "scratch" fields (the live editor for the active node) into a node struct
@@ -713,9 +719,9 @@ static void _cw_scratch_node(const dt_iop_colorwarp_params_t *p, dt_iop_colorwar
   n->convergence = p->convergence; n->affinity = p->affinity;
   n->neutral_zone = p->neutral_zone; n->neutral_falloff = p->neutral_falloff; n->priority = p->priority;
   n->per_component = p->per_component ? 1 : 0;
-  n->conv_h = p->conv_h; n->aff_h = p->aff_h; n->nz_h = p->nz_h; n->prio_h = p->prio_h;
-  n->conv_c = p->conv_c; n->aff_c = p->aff_c; n->nz_c = p->nz_c; n->prio_c = p->prio_c;
-  n->conv_l = p->conv_l; n->aff_l = p->aff_l; n->nz_l = p->nz_l; n->prio_l = p->prio_l;
+  n->conv_h = p->conv_h; n->aff_h = p->aff_h; n->nz_h = p->nz_h; n->nzf_h = p->nzf_h; n->prio_h = p->prio_h;
+  n->conv_c = p->conv_c; n->aff_c = p->aff_c; n->nz_c = p->nz_c; n->nzf_c = p->nzf_c; n->prio_c = p->prio_c;
+  n->conv_l = p->conv_l; n->aff_l = p->aff_l; n->nz_l = p->nz_l; n->nzf_l = p->nzf_l; n->prio_l = p->prio_l;
   n->absolute_target = p->absolute_target ? 1 : 0;
 }
 
@@ -1207,6 +1213,7 @@ static void _cw_default_node(dt_iop_colorwarp_node_t *n)
   n->select_light = 0.5f; n->light_range = 1.0f;
   n->feather = 0.5f; n->neutral_protect = 0.0f;
   n->neutral_falloff = 0.5f;
+  n->nzf_h = 0.5f; n->nzf_c = 0.5f; n->nzf_l = 0.5f;
 }
 
 // copy a node struct into the flat editor fields
@@ -1219,9 +1226,9 @@ static void _cw_node_to_flat(dt_iop_colorwarp_params_t *p, const dt_iop_colorwar
   p->invert = n->invert; p->shift_hue = n->shift_hue; p->shift_chroma = n->shift_chroma;
   p->shift_lightness = n->shift_lightness; p->convergence = n->convergence; p->affinity = n->affinity;
   p->neutral_zone = n->neutral_zone; p->neutral_falloff = n->neutral_falloff; p->priority = n->priority; p->per_component = n->per_component;
-  p->conv_h = n->conv_h; p->aff_h = n->aff_h; p->nz_h = n->nz_h; p->prio_h = n->prio_h;
-  p->conv_c = n->conv_c; p->aff_c = n->aff_c; p->nz_c = n->nz_c; p->prio_c = n->prio_c;
-  p->conv_l = n->conv_l; p->aff_l = n->aff_l; p->nz_l = n->nz_l; p->prio_l = n->prio_l;
+  p->conv_h = n->conv_h; p->aff_h = n->aff_h; p->nz_h = n->nz_h; p->nzf_h = n->nzf_h; p->prio_h = n->prio_h;
+  p->conv_c = n->conv_c; p->aff_c = n->aff_c; p->nz_c = n->nz_c; p->nzf_c = n->nzf_c; p->prio_c = n->prio_c;
+  p->conv_l = n->conv_l; p->aff_l = n->aff_l; p->nz_l = n->nz_l; p->nzf_l = n->nzf_l; p->prio_l = n->prio_l;
   p->absolute_target = n->absolute_target;
 }
 
@@ -1250,11 +1257,14 @@ static void _cw_sync_sliders(dt_iop_module_t *self)
   dt_bauhaus_slider_set(g->neutral_falloff, p->neutral_falloff);
   dt_bauhaus_slider_set(g->priority, p->priority);
   dt_bauhaus_slider_set(g->conv_h, p->conv_h); dt_bauhaus_slider_set(g->aff_h, p->aff_h);
-  dt_bauhaus_slider_set(g->nz_h, p->nz_h); dt_bauhaus_slider_set(g->prio_h, p->prio_h);
+  dt_bauhaus_slider_set(g->nz_h, p->nz_h); dt_bauhaus_slider_set(g->nzf_h, p->nzf_h);
+  dt_bauhaus_slider_set(g->prio_h, p->prio_h);
   dt_bauhaus_slider_set(g->conv_c, p->conv_c); dt_bauhaus_slider_set(g->aff_c, p->aff_c);
-  dt_bauhaus_slider_set(g->nz_c, p->nz_c); dt_bauhaus_slider_set(g->prio_c, p->prio_c);
+  dt_bauhaus_slider_set(g->nz_c, p->nz_c); dt_bauhaus_slider_set(g->nzf_c, p->nzf_c);
+  dt_bauhaus_slider_set(g->prio_c, p->prio_c);
   dt_bauhaus_slider_set(g->conv_l, p->conv_l); dt_bauhaus_slider_set(g->aff_l, p->aff_l);
-  dt_bauhaus_slider_set(g->nz_l, p->nz_l); dt_bauhaus_slider_set(g->prio_l, p->prio_l);
+  dt_bauhaus_slider_set(g->nz_l, p->nz_l); dt_bauhaus_slider_set(g->nzf_l, p->nzf_l);
+  dt_bauhaus_slider_set(g->prio_l, p->prio_l);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->absolute_target), p->absolute_target);
   gtk_notebook_set_current_page(g->aff_notebook, p->per_component ? 1 : 0);
   --darktable.gui->reset;
@@ -1600,18 +1610,21 @@ void gui_init(dt_iop_module_t *self)
   g->conv_h = dt_bauhaus_slider_from_params(self, "conv_h");
   g->aff_h = dt_bauhaus_slider_from_params(self, "aff_h");
   g->nz_h = dt_bauhaus_slider_from_params(self, "nz_h");
+  g->nzf_h = dt_bauhaus_slider_from_params(self, "nzf_h");
   g->prio_h = dt_bauhaus_slider_from_params(self, "prio_h");
 
   self->widget = dt_ui_notebook_page(g->aff_notebook, N_("saturation"), _("affinity for the saturation axis only"));
   g->conv_c = dt_bauhaus_slider_from_params(self, "conv_c");
   g->aff_c = dt_bauhaus_slider_from_params(self, "aff_c");
   g->nz_c = dt_bauhaus_slider_from_params(self, "nz_c");
+  g->nzf_c = dt_bauhaus_slider_from_params(self, "nzf_c");
   g->prio_c = dt_bauhaus_slider_from_params(self, "prio_c");
 
   self->widget = dt_ui_notebook_page(g->aff_notebook, N_("lightness"), _("affinity for the lightness axis only"));
   g->conv_l = dt_bauhaus_slider_from_params(self, "conv_l");
   g->aff_l = dt_bauhaus_slider_from_params(self, "aff_l");
   g->nz_l = dt_bauhaus_slider_from_params(self, "nz_l");
+  g->nzf_l = dt_bauhaus_slider_from_params(self, "nzf_l");
   g->prio_l = dt_bauhaus_slider_from_params(self, "prio_l");
 
   gtk_box_pack_start(GTK_BOX(g->affinity_cs.container), GTK_WIDGET(g->aff_notebook), FALSE, FALSE, 0);
