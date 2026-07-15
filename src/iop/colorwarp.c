@@ -962,8 +962,10 @@ static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, fl
         h = a * 2.f * M_PI_F - M_PI_F;
         if(mode == 0) { J = 0.72f; C = _cw_S_to_C(rr * rr * 0.1f, J); }        // sat wheel
         // lightness wheel: chroma grows with J so saturation rises smoothly from the neutral
-        // centre (a fixed S made colorfulness jump right off the centre -> a coloured ring)
-        else          { J = fmaxf(rr, 1e-3f); C = _cw_S_to_C(0.07f * J, J); }
+        // centre. the centre is lifted off pure black (0.08..1) so there is no singular black
+        // point to trigger a Mach-band phantom ring; this is a visualisation aid, the exact
+        // black is not needed (the selection mapping still uses the true radius).
+        else          { J = 0.08f + 0.92f * rr; C = _cw_S_to_C(0.07f * J, J); }
       }
       float rgb[3];
       _cw_jch_to_srgb(J, C, h, L_white, rgb);
@@ -1013,7 +1015,7 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
     cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_clip(cr);
     cairo_set_source_surface(cr, bg, cx - Ri, cy - Ri); cairo_paint(cr);
     cairo_restore(cr);
-    cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source_rgba(cr, 0, 0, 0, 0.15); cairo_fill(cr);
+    cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source_rgba(cr, 0, 0, 0, 0.08); cairo_fill(cr);
     cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source_rgba(cr, 1, 1, 1, 0.25);
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0)); cairo_stroke(cr);
   }
