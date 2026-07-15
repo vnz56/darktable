@@ -169,6 +169,9 @@ typedef struct dt_iop_colorwarp_gui_data_t
   int mask_mode;          // 0=off, 1=correction intensity, 2=selection (darkroom preview only)
   int view_all;           // "all nodes" preview: mask spans every node (union), not just active
   int drag;               // 0=none, 1=source, 2=target
+  cairo_surface_t *wheel_cache;   // rendered canvas background (dt UCS -> sRGB), cached
+  int cache_mode, cache_R;
+  float cache_hue;
 } dt_iop_colorwarp_gui_data_t;
 
 typedef struct dt_iop_colorwarp_nodedata_t
@@ -906,6 +909,82 @@ static void _cw_node_tgt_ab(int mode, const dt_iop_colorwarp_node_t *n, double *
   else { *a = CLAMP(n->select_sat + n->shift_chroma, 0.0, 1.0); *b = CLAMP(n->select_light + n->shift_lightness, 0.0, 1.0); }
 }
 
+// dt UCS (J, C, hue) -> display sRGB, gamut-mapped (clip negatives, scale down over-range
+// to preserve hue). used to paint the canvas with the colours the engine actually works in.
+static void _cw_jch_to_srgb(float J, float C, float h, float L_white, float rgb[3])
+{
+  dt_aligned_pixel_t JCH = { J, C, h, 0.f }, xyY, XYZ;
+  dt_UCS_JCH_to_xyY(JCH, L_white, xyY);
+  dt_xyY_to_XYZ(xyY, XYZ);
+  float lr =  3.2406f * XYZ[0] - 1.5372f * XYZ[1] - 0.4986f * XYZ[2];
+  float lg = -0.9689f * XYZ[0] + 1.8758f * XYZ[1] + 0.0415f * XYZ[2];
+  float lb =  0.0557f * XYZ[0] - 0.2040f * XYZ[1] + 1.0570f * XYZ[2];
+  lr = fmaxf(lr, 0.f); lg = fmaxf(lg, 0.f); lb = fmaxf(lb, 0.f);
+  const float mx = fmaxf(lr, fmaxf(lg, lb));
+  if(mx > 1.f) { lr /= mx; lg /= mx; lb /= mx; }   // clip to gamut keeping the hue
+  rgb[0] = powf(lr, 1.f / 2.2f); rgb[1] = powf(lg, 1.f / 2.2f); rgb[2] = powf(lb, 1.f / 2.2f);
+}
+
+// paint the canvas background from real dt UCS colours (angle = dt UCS hue, so it matches
+// the engine exactly); pixel-accurate and smooth, unlike the old vivid-sRGB mesh.
+static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, float L_white)
+{
+  const int D = 2 * Ri;
+  cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, D, D);
+  if(cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) return surf;
+  unsigned char *const data = cairo_image_surface_get_data(surf);
+  const int stride = cairo_image_surface_get_stride(surf);
+  const float sel_h = select_hue * 2.f * M_PI_F - M_PI_F;
+  DT_OMP_FOR()
+  for(int py = 0; py < D; py++)
+  {
+    unsigned char *row = data + (size_t)py * stride;
+    for(int px = 0; px < D; px++)
+    {
+      unsigned char *pix = row + px * 4;
+      const float dx = px - Ri + 0.5f, dy = py - Ri + 0.5f;
+      float J, C, h;
+      if(mode == 2)   // panel: x = saturation, y = lightness, fixed hue
+      {
+        const float a = CLAMP((dx / Ri) * 0.5f + 0.5f, 0.f, 1.f);   // saturation [0,1]
+        const float b = CLAMP(-(dy / Ri) * 0.5f + 0.5f, 0.f, 1.f);  // lightness  [0,1]
+        J = b; C = _cw_S_to_C(a * a * 0.1f, fmaxf(J, 1e-3f)); h = sel_h;
+      }
+      else            // wheel: angle = dt UCS hue, radius = saturation (0) or lightness (1)
+      {
+        const float rr = sqrtf(dx * dx + dy * dy) / Ri;
+        if(rr > 1.0f) { pix[0] = pix[1] = pix[2] = pix[3] = 0; continue; }
+        float a = -atan2f(dy, dx) / (2.f * M_PI_F); a -= floorf(a);   // hue turn
+        h = a * 2.f * M_PI_F - M_PI_F;
+        if(mode == 0) { J = 0.72f; C = _cw_S_to_C(rr * rr * 0.1f, J); }        // sat wheel
+        else          { J = fmaxf(rr, 1e-3f); C = _cw_S_to_C(0.05f, J); }      // lightness wheel
+      }
+      float rgb[3];
+      _cw_jch_to_srgb(J, C, h, L_white, rgb);
+      pix[0] = (unsigned char)(CLAMP(rgb[2], 0.f, 1.f) * 255.f + 0.5f);   // B
+      pix[1] = (unsigned char)(CLAMP(rgb[1], 0.f, 1.f) * 255.f + 0.5f);   // G
+      pix[2] = (unsigned char)(CLAMP(rgb[0], 0.f, 1.f) * 255.f + 0.5f);   // R
+      pix[3] = 255;
+    }
+  }
+  cairo_surface_mark_dirty(surf);
+  return surf;
+}
+
+// cached accessor: re-render only when the mode, size, or (panel) hue changes
+static cairo_surface_t *_cw_canvas_surface(dt_iop_colorwarp_gui_data_t *g, int mode, int Ri,
+                                           float select_hue, float L_white)
+{
+  const float key_hue = (mode == 2) ? select_hue : 0.f;
+  if(g->wheel_cache && g->cache_mode == mode && g->cache_R == Ri
+     && fabsf(g->cache_hue - key_hue) < 1e-4f)
+    return g->wheel_cache;
+  if(g->wheel_cache) cairo_surface_destroy(g->wheel_cache);
+  g->wheel_cache = _cw_render_canvas(mode, Ri, select_hue, L_white);
+  g->cache_mode = mode; g->cache_R = Ri; g->cache_hue = key_hue;
+  return g->wheel_cache;
+}
+
 static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
@@ -917,56 +996,28 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
   const double R = fmin(al.width, al.height) / 2.0 - DT_PIXEL_APPLY_DPI(8.0);
   if(R < 4.0) return FALSE;
 
-  cw_hs_t s[CW_HUE_SAMPLES];
-  _cw_hue_samples(s);
+  // real dt UCS colours, rendered pixel-accurate into a cached surface
+  const float L_white = Y_to_dt_UCS_L_star(1.0f);
+  const int Ri = (int)(R + 1.5);
+  cairo_surface_t *bg = _cw_canvas_surface(g, mode, Ri, p->center_hue, L_white);
 
   if(mode != 2)   // WHEEL: hue = angle; radius = saturation (mode 0) or lightness (mode 1)
   {
-    // mode 1 fades to black at the centre (lightness), mode 0 to neutral grey (saturation)
-    const double c_centre = (mode == 1) ? 0.0 : 0.5;
-    const int NW = 120;
-    cairo_pattern_t *mesh = cairo_pattern_create_mesh();
-    for(int i = 0; i < NW; i++)
-    {
-      const double a0 = -2.0 * M_PI * i / NW, a1 = -2.0 * M_PI * (i + 1) / NW;
-      float c0[3], c1[3];
-      _cw_color_at((float)i / NW, s, c0);
-      _cw_color_at((float)(i + 1) / NW, s, c1);
-      cairo_mesh_pattern_begin_patch(mesh);
-      cairo_mesh_pattern_move_to(mesh, cx, cy);
-      cairo_mesh_pattern_line_to(mesh, cx + cos(a0) * R, cy + sin(a0) * R);
-      cairo_mesh_pattern_line_to(mesh, cx + cos(a1) * R, cy + sin(a1) * R);
-      cairo_mesh_pattern_line_to(mesh, cx, cy);
-      cairo_mesh_pattern_set_corner_color_rgb(mesh, 0, c_centre, c_centre, c_centre);
-      cairo_mesh_pattern_set_corner_color_rgb(mesh, 1, c0[0], c0[1], c0[2]);
-      cairo_mesh_pattern_set_corner_color_rgb(mesh, 2, c1[0], c1[1], c1[2]);
-      cairo_mesh_pattern_set_corner_color_rgb(mesh, 3, c_centre, c_centre, c_centre);
-      cairo_mesh_pattern_end_patch(mesh);
-    }
-    cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source(cr, mesh); cairo_fill(cr);
-    cairo_pattern_destroy(mesh);
-    cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source_rgba(cr, 0.1, 0.1, 0.1, 0.35); cairo_fill(cr);
+    cairo_save(cr);
+    cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_clip(cr);
+    cairo_set_source_surface(cr, bg, cx - Ri, cy - Ri); cairo_paint(cr);
+    cairo_restore(cr);
+    cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source_rgba(cr, 0, 0, 0, 0.15); cairo_fill(cr);
     cairo_arc(cr, cx, cy, R, 0, 2.0 * M_PI); cairo_set_source_rgba(cr, 1, 1, 1, 0.25);
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0)); cairo_stroke(cr);
   }
   else            // PANEL: fixed hue, x = saturation, y = lightness
   {
-    float hue[3];
-    _cw_color_at(p->center_hue, s, hue);
-    cairo_pattern_t *mesh = cairo_pattern_create_mesh();
-    cairo_mesh_pattern_begin_patch(mesh);
-    cairo_mesh_pattern_move_to(mesh, cx - R, cy + R);   // 0: S=0,L=0
-    cairo_mesh_pattern_line_to(mesh, cx + R, cy + R);   // 1: S=1,L=0
-    cairo_mesh_pattern_line_to(mesh, cx + R, cy - R);   // 2: S=1,L=1
-    cairo_mesh_pattern_line_to(mesh, cx - R, cy - R);   // 3: S=0,L=1
-    cairo_mesh_pattern_set_corner_color_rgb(mesh, 0, 0, 0, 0);
-    cairo_mesh_pattern_set_corner_color_rgb(mesh, 1, 0, 0, 0);
-    cairo_mesh_pattern_set_corner_color_rgb(mesh, 2, hue[0], hue[1], hue[2]);
-    cairo_mesh_pattern_set_corner_color_rgb(mesh, 3, 0.82, 0.82, 0.82);
-    cairo_mesh_pattern_end_patch(mesh);
-    cairo_rectangle(cr, cx - R, cy - R, 2 * R, 2 * R);
-    cairo_set_source(cr, mesh); cairo_fill(cr); cairo_pattern_destroy(mesh);
-    cairo_rectangle(cr, cx - R, cy - R, 2 * R, 2 * R); cairo_set_source_rgba(cr, 0.1, 0.1, 0.1, 0.3); cairo_fill(cr);
+    cairo_save(cr);
+    cairo_rectangle(cr, cx - R, cy - R, 2 * R, 2 * R); cairo_clip(cr);
+    cairo_set_source_surface(cr, bg, cx - Ri, cy - Ri); cairo_paint(cr);
+    cairo_restore(cr);
+    cairo_rectangle(cr, cx - R, cy - R, 2 * R, 2 * R); cairo_set_source_rgba(cr, 0, 0, 0, 0.12); cairo_fill(cr);
     cairo_rectangle(cr, cx - R, cy - R, 2 * R, 2 * R); cairo_set_source_rgba(cr, 1, 1, 1, 0.25);
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0)); cairo_stroke(cr);
   }
@@ -1355,6 +1406,12 @@ static void _cw_node_remove(GtkWidget *w, dt_iop_module_t *self)
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
   if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
   dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
+void gui_cleanup(dt_iop_module_t *self)
+{
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  if(g && g->wheel_cache) cairo_surface_destroy(g->wheel_cache);
 }
 
 void gui_update(dt_iop_module_t *self)
