@@ -649,15 +649,22 @@ void process(dt_iop_module_t *self,
   // optional: edge-aware smoothing of the accumulated move, to cut the noise that the
   // per-pixel converge / priority / affinity terms pick up in low-chroma shadows.
   // one pass per axis on the summed field (independent of node count); mask/mask_f are free.
-  const int cw = (int)(d->corr_smooth * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
-  if(d->corr_smooth > 0.f && cw >= 1 && mask_mode == 0)
+  // radius is an integer box window -> coarse steps; fine control is a continuous raw->smoothed
+  // blend, min radius 1 once active (so no OFF->ON jump).
+  const float cblend = CLAMP(d->corr_smooth, 0.0f, 1.0f);
+  const int cw = MAX(1, (int)(d->corr_smooth * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f));
+  // run in normal render AND the correction-intensity preview (mask_mode 1) so the effect is
+  // visible in the mask; skip only the selection preview (mask_mode 2, acc_* unused there).
+  if(d->corr_smooth > 0.f && mask_mode != 2)
   {
     float *const restrict accs[3] = { acc_h, acc_s, acc_l };
     for(int c = 0; c < 3; c++)
     {
-      guided_filter(ivoid, accs[c], mask_f, W, H, 4, cw, d->edge_eps, 1.0f, 0.0f, 1.0f);
+      // the move deltas are SIGNED (e.g. a chroma reduction is negative) -> a [0,1] clamp would
+      // erase them; pass a wide range so the guided filter only smooths, never clips the sign.
+      guided_filter(ivoid, accs[c], mask_f, W, H, 4, cw, d->edge_eps, 1.0f, -1e6f, 1e6f);
       DT_OMP_FOR()
-      for(size_t k = 0; k < npixels; k++) accs[c][k] = mask_f[k];
+      for(size_t k = 0; k < npixels; k++) accs[c][k] = accs[c][k] * (1.0f - cblend) + mask_f[k] * cblend;
     }
   }
 
