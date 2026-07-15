@@ -152,6 +152,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *conv_h, *aff_h, *nz_h, *prio_h;
   GtkWidget *conv_c, *aff_c, *nz_c, *prio_c;
   GtkWidget *conv_l, *aff_l, *nz_l, *prio_l;
+  dt_gui_collapsible_section_t affinity_cs, refine_cs;   // collapsible advanced sections
   GtkDrawingArea *area;   // selection canvas
   GtkWidget *mode_combo;  // which 2 axes the canvas shows
   GtkWidget *fine_toggle; // reveal the axis sliders already on the canvas
@@ -1403,7 +1404,7 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(G_OBJECT(g->area), "motion-notify-event", G_CALLBACK(_cw_motion), self);
   gtk_box_pack_start(GTK_BOX(self->widget), GTK_WIDGET(g->area), TRUE, TRUE, 0);
 
-  // which two axes the canvas shows
+  // ---- context band: how the canvas and the move behave ----
   g->mode = CLAMP(dt_conf_get_int("plugins/darkroom/colorwarp/canvasmode"), 0, 2);
   g->mode_combo = dt_bauhaus_combobox_new(self);
   dt_bauhaus_widget_set_label(g->mode_combo, NULL, N_("canvas view"));
@@ -1416,13 +1417,17 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(G_OBJECT(g->mode_combo), "value-changed", G_CALLBACK(_cw_mode_changed), self);
   gtk_box_pack_start(GTK_BOX(self->widget), g->mode_combo, FALSE, FALSE, 0);
 
-  // reveal the sliders for the axes already dragged on the canvas
-  g->fine_toggle = gtk_check_button_new_with_label(_("show all controls"));
-  gtk_widget_set_tooltip_text(g->fine_toggle,
-                              _("also show the sliders for the two axes already on the canvas,\n"
-                                "for precise numeric tuning"));
-  g_signal_connect(G_OBJECT(g->fine_toggle), "toggled", G_CALLBACK(_cw_fine_toggled), self);
-  gtk_box_pack_start(GTK_BOX(self->widget), g->fine_toggle, FALSE, FALSE, 0);
+  g->polar_move = dt_bauhaus_toggle_from_params(self, "polar_move");
+  gtk_widget_set_tooltip_text(g->polar_move, _("how the move is applied.\n"
+                                              "on (polar): ROTATE hue around neutral, keeping each\n"
+                                              "pixel's saturation — natural for grading existing colours.\n"
+                                              "off (a/b slide): move in the absolute chroma plane — tints\n"
+                                              "neutrals cleanly, uniform tints, split toning."));
+
+  g->absolute_target = dt_bauhaus_toggle_from_params(self, "absolute_target");
+  gtk_widget_set_tooltip_text(g->absolute_target, _("keep the target fixed when you re-grab a colour\n"
+                                                   "(converge different families to the same target).\n"
+                                                   "off = the target follows the selection (a grade)."));
 
   // show the selection / correction as a grayscale mask (darkroom preview only)
   g->mask_mode = 0;
@@ -1456,13 +1461,15 @@ void gui_init(dt_iop_module_t *self)
   gtk_box_pack_start(GTK_BOX(nrow), g->node_remove, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(self->widget), nrow, FALSE, FALSE, 0);
 
-  // master dose on top: it multiplies the whole H/S/L move below.
+  // master dose: it multiplies the whole H/S/L move below.
   g->strength = dt_bauhaus_slider_from_params(self, "strength");
   gtk_widget_set_tooltip_text(g->strength, _("master intensity: scales the whole shift below.\n"
                                              "set your hue/saturation/lightness shifts first,\n"
                                              "then use this to dose or A/B the effect.\n"
                                              "at 0 (or with all shifts at 0) the module does nothing."));
 
+  // ---- SELECTION ----
+  gtk_box_pack_start(GTK_BOX(self->widget), dt_ui_section_label_new(_("selection")), FALSE, FALSE, 0);
   g->center_hue = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
                                       dt_bauhaus_slider_from_params(self, "center_hue"));
   gtk_widget_set_tooltip_text(g->center_hue, _("hue of the colour family to grab.\n"
@@ -1511,6 +1518,16 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->invert, _("invert the selection: affect everything EXCEPT the\n"
                                           "selected hue/saturation/lightness region (neutrals stay protected)."));
 
+  // reveal the on-canvas axis sliders for precise numeric tuning
+  g->fine_toggle = gtk_check_button_new_with_label(_("show all controls"));
+  gtk_widget_set_tooltip_text(g->fine_toggle,
+                              _("also show the sliders for the two axes already on the canvas,\n"
+                                "for precise numeric tuning"));
+  g_signal_connect(G_OBJECT(g->fine_toggle), "toggled", G_CALLBACK(_cw_fine_toggled), self);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->fine_toggle, FALSE, FALSE, 0);
+
+  // ---- MOVE ----
+  gtk_box_pack_start(GTK_BOX(self->widget), dt_ui_section_label_new(_("move")), FALSE, FALSE, 0);
   g->shift_hue = dt_bauhaus_slider_from_params(self, "shift_hue");
   gtk_widget_set_tooltip_text(g->shift_hue, _("rotate the grabbed colours' hue (scaled by strength)"));
   g->shift_chroma = dt_bauhaus_slider_from_params(self, "shift_chroma");
@@ -1518,21 +1535,12 @@ void gui_init(dt_iop_module_t *self)
   g->shift_lightness = dt_bauhaus_slider_from_params(self, "shift_lightness");
   gtk_widget_set_tooltip_text(g->shift_lightness, _("change the grabbed colours' lightness (scaled by strength)"));
 
-  g->absolute_target = dt_bauhaus_toggle_from_params(self, "absolute_target");
-  gtk_widget_set_tooltip_text(g->absolute_target, _("keep the target fixed when you re-grab a colour\n"
-                                                   "(converge different families to the same target).\n"
-                                                   "off = the target follows the selection (a grade)."));
-
-  g->polar_move = dt_bauhaus_toggle_from_params(self, "polar_move");
-  gtk_widget_set_tooltip_text(g->polar_move, _("how the move is applied.\n"
-                                              "on (polar): ROTATE hue around neutral, keeping each\n"
-                                              "pixel's saturation — natural for grading existing colours.\n"
-                                              "off (a/b slide): move in the absolute chroma plane — tints\n"
-                                              "neutrals cleanly, uniform tints, split toning."));
-
-  // --- affinity: a notebook. page 0 = global (one affinity for all axes); pages 1-3 =
-  //     per component. the selected page is the mode (global page vs per-component). ---
+  // ---- AFFINITY (collapsible) ----
   GtkWidget *box = self->widget;
+  dt_gui_new_collapsible_section(&g->affinity_cs, "plugins/darkroom/colorwarp/expand_affinity",
+                                 _("affinity"), GTK_BOX(box), DT_ACTION(self));
+  self->widget = GTK_WIDGET(g->affinity_cs.container);
+  // page 0 = global (one affinity for all axes); pages 1-3 = per component. selected page = mode.
   static dt_action_def_t aff_nb_def = { 0 };
   g->aff_notebook = dt_ui_notebook_new(&aff_nb_def);
   dt_action_define_iop(self, NULL, N_("affinity page"), GTK_WIDGET(g->aff_notebook), &aff_nb_def);
@@ -1570,9 +1578,14 @@ void gui_init(dt_iop_module_t *self)
   g->nz_l = dt_bauhaus_slider_from_params(self, "nz_l");
   g->prio_l = dt_bauhaus_slider_from_params(self, "prio_l");
 
-  self->widget = box;   // restore the main container
-  gtk_box_pack_start(GTK_BOX(box), GTK_WIDGET(g->aff_notebook), FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(g->affinity_cs.container), GTK_WIDGET(g->aff_notebook), FALSE, FALSE, 0);
   g_signal_connect(G_OBJECT(g->aff_notebook), "switch-page", G_CALLBACK(_cw_aff_page), self);
+
+  // ---- REFINE & DENOISE (collapsible) ----
+  self->widget = box;
+  dt_gui_new_collapsible_section(&g->refine_cs, "plugins/darkroom/colorwarp/expand_refine",
+                                 _("refine & denoise"), GTK_BOX(box), DT_ACTION(self));
+  self->widget = GTK_WIDGET(g->refine_cs.container);
 
   g->smoothing = dt_bauhaus_slider_from_params(self, "smoothing");
   gtk_widget_set_tooltip_text(g->smoothing, _("edge-aware smoothing of the selection to remove\n"
@@ -1604,6 +1617,8 @@ void gui_init(dt_iop_module_t *self)
                                                  "selection in noisy low-chroma shadows stays clean at\n"
                                                  "its edges. best fix for shadow speckle; 0 = off\n"
                                                  "(otherwise allocates working buffers)."));
+
+  self->widget = box;   // restore the module root container
 
   // start on the affinity page that matches the saved mode
   gtk_notebook_set_current_page(g->aff_notebook,
