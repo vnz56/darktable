@@ -152,10 +152,9 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *conv_h, *aff_h, *nz_h, *prio_h;
   GtkWidget *conv_c, *aff_c, *nz_c, *prio_c;
   GtkWidget *conv_l, *aff_l, *nz_l, *prio_l;
-  dt_gui_collapsible_section_t affinity_cs, refine_cs;   // collapsible advanced sections
+  dt_gui_collapsible_section_t selection_cs, move_cs, affinity_cs, refine_cs;   // collapsible sections
   GtkDrawingArea *area;   // selection canvas
   GtkWidget *mode_combo;  // which 2 axes the canvas shows
-  GtkWidget *fine_toggle; // reveal the axis sliders already on the canvas
   GtkWidget *mask_combo;  // show mask: off / correction / selection
   GtkWidget *node_combo, *node_add, *node_remove;  // node selector
   int mode;               // 0=hue/sat (wheel), 1=hue/light (wheel), 2=sat/light (panel)
@@ -1135,35 +1134,11 @@ static gboolean _cw_release(GtkWidget *widget, GdkEventButton *e, dt_iop_module_
 
 // declutter: show only the complementary axis's sliders by default (the two axes on
 // the canvas are dragged there); "show all controls" reveals the rest for fine tuning.
-static void _cw_update_visibility(dt_iop_module_t *self)
-{
-  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
-  const gboolean all = g->fine_toggle && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->fine_toggle));
-  const gboolean hue = all || (g->mode == 2);   // hue is complementary in sat/light view
-  const gboolean sat = all || (g->mode == 1);   // saturation complementary in hue/light view
-  const gboolean lgt = all || (g->mode == 0);   // lightness complementary in hue/sat view
-  gtk_widget_set_visible(g->center_hue, hue);
-  gtk_widget_set_visible(g->reach, hue);
-  gtk_widget_set_visible(g->shift_hue, hue);
-  gtk_widget_set_visible(g->select_sat, sat);
-  gtk_widget_set_visible(g->sat_range, sat);
-  gtk_widget_set_visible(g->shift_chroma, sat);
-  gtk_widget_set_visible(g->select_light, lgt);
-  gtk_widget_set_visible(g->light_range, lgt);
-  gtk_widget_set_visible(g->shift_lightness, lgt);
-}
-
-static void _cw_fine_toggled(GtkWidget *w, dt_iop_module_t *self)
-{
-  _cw_update_visibility(self);
-}
-
 static void _cw_mode_changed(GtkWidget *w, dt_iop_module_t *self)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
   g->mode = CLAMP(dt_bauhaus_combobox_get(w), 0, 2);
   dt_conf_set_int("plugins/darkroom/colorwarp/canvasmode", g->mode);
-  _cw_update_visibility(self);
   if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
 }
 
@@ -1417,17 +1392,22 @@ void gui_init(dt_iop_module_t *self)
   g_signal_connect(G_OBJECT(g->mode_combo), "value-changed", G_CALLBACK(_cw_mode_changed), self);
   gtk_box_pack_start(GTK_BOX(self->widget), g->mode_combo, FALSE, FALSE, 0);
 
+  // move-mode toggles, one row: hue rotation | absolute target
+  GtkWidget *modes_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_BAUHAUS_SPACE);
+  gtk_box_pack_start(GTK_BOX(self->widget), modes_row, FALSE, FALSE, 0);
+  GtkWidget *rootw = self->widget;
+  self->widget = modes_row;
   g->polar_move = dt_bauhaus_toggle_from_params(self, "polar_move");
   gtk_widget_set_tooltip_text(g->polar_move, _("how the move is applied.\n"
                                               "on (polar): ROTATE hue around neutral, keeping each\n"
                                               "pixel's saturation — natural for grading existing colours.\n"
                                               "off (a/b slide): move in the absolute chroma plane — tints\n"
                                               "neutrals cleanly, uniform tints, split toning."));
-
   g->absolute_target = dt_bauhaus_toggle_from_params(self, "absolute_target");
   gtk_widget_set_tooltip_text(g->absolute_target, _("keep the target fixed when you re-grab a colour\n"
                                                    "(converge different families to the same target).\n"
                                                    "off = the target follows the selection (a grade)."));
+  self->widget = rootw;
 
   // show the selection / correction as a grayscale mask (darkroom preview only)
   g->mask_mode = 0;
@@ -1468,8 +1448,13 @@ void gui_init(dt_iop_module_t *self)
                                              "then use this to dose or A/B the effect.\n"
                                              "at 0 (or with all shifts at 0) the module does nothing."));
 
-  // ---- SELECTION ----
-  gtk_box_pack_start(GTK_BOX(self->widget), dt_ui_section_label_new(_("selection")), FALSE, FALSE, 0);
+  // ---- SELECTION (collapsible, open by default) ----
+  GtkWidget *box = self->widget;
+  if(!dt_conf_key_exists("plugins/darkroom/colorwarp/expand_selection"))
+    dt_conf_set_bool("plugins/darkroom/colorwarp/expand_selection", TRUE);
+  dt_gui_new_collapsible_section(&g->selection_cs, "plugins/darkroom/colorwarp/expand_selection",
+                                 _("selection"), GTK_BOX(box), DT_ACTION(self));
+  self->widget = GTK_WIDGET(g->selection_cs.container);
   g->center_hue = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
                                       dt_bauhaus_slider_from_params(self, "center_hue"));
   gtk_widget_set_tooltip_text(g->center_hue, _("hue of the colour family to grab.\n"
@@ -1518,25 +1503,29 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->invert, _("invert the selection: affect everything EXCEPT the\n"
                                           "selected hue/saturation/lightness region (neutrals stay protected)."));
 
-  // reveal the on-canvas axis sliders for precise numeric tuning
-  g->fine_toggle = gtk_check_button_new_with_label(_("show all controls"));
-  gtk_widget_set_tooltip_text(g->fine_toggle,
-                              _("also show the sliders for the two axes already on the canvas,\n"
-                                "for precise numeric tuning"));
-  g_signal_connect(G_OBJECT(g->fine_toggle), "toggled", G_CALLBACK(_cw_fine_toggled), self);
-  gtk_box_pack_start(GTK_BOX(self->widget), g->fine_toggle, FALSE, FALSE, 0);
-
-  // ---- MOVE ----
-  gtk_box_pack_start(GTK_BOX(self->widget), dt_ui_section_label_new(_("move")), FALSE, FALSE, 0);
+  // ---- MOVE (collapsible, open by default) ----
+  self->widget = box;
+  if(!dt_conf_key_exists("plugins/darkroom/colorwarp/expand_move"))
+    dt_conf_set_bool("plugins/darkroom/colorwarp/expand_move", TRUE);
+  dt_gui_new_collapsible_section(&g->move_cs, "plugins/darkroom/colorwarp/expand_move",
+                                 _("move"), GTK_BOX(box), DT_ACTION(self));
+  self->widget = GTK_WIDGET(g->move_cs.container);
   g->shift_hue = dt_bauhaus_slider_from_params(self, "shift_hue");
-  gtk_widget_set_tooltip_text(g->shift_hue, _("rotate the grabbed colours' hue (scaled by strength)"));
+  gtk_widget_set_tooltip_text(g->shift_hue, _("target hue to push the grabbed colours toward.\n"
+                                             "like 'select hue': right-click for the colour wheel.\n"
+                                             "(scaled by strength)"));
+  // same hue bar + colour-wheel popup as 'select hue' (span -180..+180 = a full turn)
+  dt_bauhaus_slider_set_format(g->shift_hue, "°");
+  dt_bauhaus_slider_set_factor(g->shift_hue, 360.0f);
+  dt_bauhaus_slider_set_feedback(g->shift_hue, 0);
+  _cw_paint_hue_slider(g->shift_hue);
   g->shift_chroma = dt_bauhaus_slider_from_params(self, "shift_chroma");
   gtk_widget_set_tooltip_text(g->shift_chroma, _("change the grabbed colours' saturation (scaled by strength)"));
   g->shift_lightness = dt_bauhaus_slider_from_params(self, "shift_lightness");
   gtk_widget_set_tooltip_text(g->shift_lightness, _("change the grabbed colours' lightness (scaled by strength)"));
 
   // ---- AFFINITY (collapsible) ----
-  GtkWidget *box = self->widget;
+  self->widget = box;
   dt_gui_new_collapsible_section(&g->affinity_cs, "plugins/darkroom/colorwarp/expand_affinity",
                                  _("affinity"), GTK_BOX(box), DT_ACTION(self));
   self->widget = GTK_WIDGET(g->affinity_cs.container);
@@ -1624,13 +1613,6 @@ void gui_init(dt_iop_module_t *self)
   gtk_notebook_set_current_page(g->aff_notebook,
                                 ((dt_iop_colorwarp_params_t *)self->params)->per_component ? 1 : 0);
   _cw_rebuild_node_combo(self);
-
-  // the 9 axis sliders are shown/hidden per canvas view -> keep show_all from forcing them
-  GtkWidget *managed[] = { g->center_hue, g->reach, g->shift_hue,
-                           g->select_sat, g->sat_range, g->shift_chroma,
-                           g->select_light, g->light_range, g->shift_lightness };
-  for(int i = 0; i < 9; i++) gtk_widget_set_no_show_all(managed[i], TRUE);
-  _cw_update_visibility(self);
 }
 
 // clang-format off
