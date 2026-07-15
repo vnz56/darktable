@@ -75,6 +75,7 @@ typedef struct dt_iop_colorwarp_node_t
   float convergence;      // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float affinity;         // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   float neutral_zone;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0
+  float neutral_falloff;  // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5
   float priority;         // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
   int per_component;      // $DEFAULT: 0
   float conv_h;           // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0
@@ -113,6 +114,7 @@ typedef struct dt_iop_colorwarp_params_t
   float convergence;      // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "convergence"
   float affinity;         // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "affinity"
   float neutral_zone;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "neutral zone"
+  float neutral_falloff;  // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.5 $DESCRIPTION: "neutral fall-off"
   float priority;         // $MIN: -1.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "priority"
   // --- affinity, per component (used when per_component is on) ---
   gboolean per_component; // $DEFAULT: FALSE $DESCRIPTION: "per-component affinity"
@@ -146,7 +148,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *strength, *center_hue, *reach, *select_sat, *sat_range, *select_light, *light_range, *invert;
   GtkWidget *feather, *neutral_protect;
   GtkWidget *shift_hue, *shift_chroma, *shift_lightness, *convergence, *affinity;
-  GtkWidget *neutral_zone, *priority, *absolute_target, *smoothing, *edge, *use_eigf, *corr_smooth, *input_smooth;
+  GtkWidget *neutral_zone, *neutral_falloff, *priority, *absolute_target, *smoothing, *edge, *use_eigf, *corr_smooth, *input_smooth;
   GtkWidget *polar_move;
   GtkNotebook *aff_notebook;   // affinity: global + per-component pages
   GtkWidget *conv_h, *aff_h, *nz_h, *prio_h;
@@ -181,6 +183,7 @@ typedef struct dt_iop_colorwarp_nodedata_t
   float convergence;     // -1 diverge .. 0 translate .. 1 converge (global)
   float affinity;        // boost (>0) / core-preserving donut depth (<0) (global)
   float neutral_zone;    // preserved-core radius [0,1] (with negative affinity) (global)
+  float neutral_falloff; // width of the transition out of the preserved core [0,1] (global)
   float priority;        // per-axis asymmetry [-1,1] (global)
   int per_component;     // use the per-axis affinity sets instead of the global one
   float conv_h, aff_h, nz_h, prio_h;   // per-component affinity: hue
@@ -268,8 +271,10 @@ static inline float _cw_neutral_radius(const float neutral)
 }
 
 // affinity weight (coloruniformity model): >=0 boost the correction; <0 preserve a core
-// of radius r around the target, by depth |affinity|.
-static inline float _cw_affinity_weight(const float affinity, const float neutral, const float dist)
+// of radius r around the target, by depth |affinity|. falloff [0,1] widens the transition
+// out of the core (small = crisp edge, large = gentle, less visible slope).
+static inline float _cw_affinity_weight(const float affinity, const float neutral,
+                                        const float falloff, const float dist)
 {
   if(affinity >= 0.0f) return 1.0f + affinity;
   const float r = _cw_neutral_radius(neutral);
@@ -277,7 +282,7 @@ static inline float _cw_affinity_weight(const float affinity, const float neutra
   if(dist <= r) hole = 1.0f;
   else
   {
-    const float edge = fmaxf(r * 0.5f, 1e-4f);
+    const float edge = fmaxf(r * (0.15f + 2.5f * CLAMP(falloff, 0.0f, 1.0f)), 1e-4f);
     const float u = CLAMP((dist - r) / edge, 0.0f, 1.0f);
     hole = 1.0f - u * u * (3.0f - 2.0f * u);   // smoothstep down
   }
@@ -287,9 +292,10 @@ static inline float _cw_affinity_weight(const float affinity, const float neutra
 // one axis' move, using that axis' distance for the affinity weight (per-component path).
 // dtc = target - centre (translate delta, pre-wrapped for hue); dt = target - value.
 static inline float _cw_axis_move(const float dtc, const float dt, const float w_base,
-                                  const float conv, const float aff, const float nz, const float prio)
+                                  const float conv, const float aff, const float nz,
+                                  const float falloff, const float prio)
 {
-  const float w = w_base * _cw_affinity_weight(aff, nz, fabsf(dt));
+  const float w = w_base * _cw_affinity_weight(aff, nz, falloff, fabsf(dt));
   const float wt = w * (1.0f - conv);
   const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
   const float p = CLAMP(1.0f - prio * tanhf(dt * 4.0f), 0.0f, 2.0f);
@@ -459,6 +465,7 @@ void process(dt_iop_module_t *self,
     }
 
     const float conv = nd->convergence, affinity = nd->affinity, neutral = nd->neutral_zone;
+    const float nfall = nd->neutral_falloff;
     const float strength = nd->strength;
 
     if(d->polar_move)
@@ -494,14 +501,14 @@ void process(dt_iop_module_t *self,
 
         if(nd->per_component)
         {
-          acc_h[k] += _cw_axis_move(dct_h, dth, w_base, nd->conv_h, nd->aff_h, nd->nz_h, nd->prio_h);
-          acc_s[k] += _cw_axis_move(dct_s, dts, w_base, nd->conv_c, nd->aff_c, nd->nz_c, nd->prio_c);
-          acc_l[k] += _cw_axis_move(dct_l, dtl, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->prio_l);
+          acc_h[k] += _cw_axis_move(dct_h, dth, w_base, nd->conv_h, nd->aff_h, nd->nz_h, nfall, nd->prio_h);
+          acc_s[k] += _cw_axis_move(dct_s, dts, w_base, nd->conv_c, nd->aff_c, nd->nz_c, nfall, nd->prio_c);
+          acc_l[k] += _cw_axis_move(dct_l, dtl, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nfall, nd->prio_l);
         }
         else
         {
           const float dist = sqrtf(dth * dth + dts * dts + dtl * dtl);
-          const float w = w_base * _cw_affinity_weight(affinity, neutral, dist);
+          const float w = w_base * _cw_affinity_weight(affinity, neutral, nfall, dist);
           const float wt = w * (1.0f - conv);
           const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
           const float ph = CLAMP(1.0f - prio * tanhf(dth * 4.0f), 0.0f, 2.0f);
@@ -546,19 +553,19 @@ void process(dt_iop_module_t *self,
         {
           const float da = a_t - a_p, db = b_t - b_p;
           const float distc = sqrtf(da * da + db * db);            // chroma plane uses the "saturation" set
-          const float w = w_base * _cw_affinity_weight(nd->aff_c, nd->nz_c, distc);
+          const float w = w_base * _cw_affinity_weight(nd->aff_c, nd->nz_c, nfall, distc);
           const float wt = w * (1.0f - nd->conv_c);
           const float wc = (nd->conv_c > 0.0f) ? fminf(w * nd->conv_c, 1.0f) : w * nd->conv_c;
           acc_h[k] += wt * (a_t - a_c) + wc * da;
           acc_s[k] += wt * (b_t - b_c) + wc * db;
-          acc_l[k] += _cw_axis_move(t_lgt - c_lgt, t_lgt - J, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nd->prio_l);
+          acc_l[k] += _cw_axis_move(t_lgt - c_lgt, t_lgt - J, w_base, nd->conv_l, nd->aff_l, nd->nz_l, nfall, nd->prio_l);
         }
         else
         {
           // convergence acts on the CHROMA plane only; lightness just translates by its shift.
           const float da = a_t - a_p, db = b_t - b_p;
           const float dist = sqrtf(da * da + db * db);
-          const float w = w_base * _cw_affinity_weight(affinity, neutral, dist);
+          const float w = w_base * _cw_affinity_weight(affinity, neutral, nfall, dist);
           const float wt = w * (1.0f - conv);
           const float wc = (conv > 0.0f) ? fminf(w * conv, 1.0f) : w * conv;
           acc_h[k] += wt * (a_t - a_c) + wc * da;
@@ -686,6 +693,7 @@ static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_
   nd->convergence = n->convergence;
   nd->affinity = n->affinity;
   nd->neutral_zone = n->neutral_zone;
+  nd->neutral_falloff = n->neutral_falloff;
   nd->priority = n->priority;
   nd->per_component = n->per_component ? 1 : 0;
   nd->conv_h = n->conv_h; nd->aff_h = n->aff_h; nd->nz_h = n->nz_h; nd->prio_h = n->prio_h;
@@ -703,7 +711,7 @@ static void _cw_scratch_node(const dt_iop_colorwarp_params_t *p, dt_iop_colorwar
   n->invert = p->invert ? 1 : 0;
   n->shift_hue = p->shift_hue; n->shift_chroma = p->shift_chroma; n->shift_lightness = p->shift_lightness;
   n->convergence = p->convergence; n->affinity = p->affinity;
-  n->neutral_zone = p->neutral_zone; n->priority = p->priority;
+  n->neutral_zone = p->neutral_zone; n->neutral_falloff = p->neutral_falloff; n->priority = p->priority;
   n->per_component = p->per_component ? 1 : 0;
   n->conv_h = p->conv_h; n->aff_h = p->aff_h; n->nz_h = p->nz_h; n->prio_h = p->prio_h;
   n->conv_c = p->conv_c; n->aff_c = p->aff_c; n->nz_c = p->nz_c; n->prio_c = p->prio_c;
@@ -1198,6 +1206,7 @@ static void _cw_default_node(dt_iop_colorwarp_node_t *n)
   n->select_sat = 0.5f; n->sat_range = 1.0f;
   n->select_light = 0.5f; n->light_range = 1.0f;
   n->feather = 0.5f; n->neutral_protect = 0.0f;
+  n->neutral_falloff = 0.5f;
 }
 
 // copy a node struct into the flat editor fields
@@ -1209,7 +1218,7 @@ static void _cw_node_to_flat(dt_iop_colorwarp_params_t *p, const dt_iop_colorwar
   p->feather = n->feather; p->neutral_protect = n->neutral_protect;
   p->invert = n->invert; p->shift_hue = n->shift_hue; p->shift_chroma = n->shift_chroma;
   p->shift_lightness = n->shift_lightness; p->convergence = n->convergence; p->affinity = n->affinity;
-  p->neutral_zone = n->neutral_zone; p->priority = n->priority; p->per_component = n->per_component;
+  p->neutral_zone = n->neutral_zone; p->neutral_falloff = n->neutral_falloff; p->priority = n->priority; p->per_component = n->per_component;
   p->conv_h = n->conv_h; p->aff_h = n->aff_h; p->nz_h = n->nz_h; p->prio_h = n->prio_h;
   p->conv_c = n->conv_c; p->aff_c = n->aff_c; p->nz_c = n->nz_c; p->prio_c = n->prio_c;
   p->conv_l = n->conv_l; p->aff_l = n->aff_l; p->nz_l = n->nz_l; p->prio_l = n->prio_l;
@@ -1238,6 +1247,7 @@ static void _cw_sync_sliders(dt_iop_module_t *self)
   dt_bauhaus_slider_set(g->convergence, p->convergence);
   dt_bauhaus_slider_set(g->affinity, p->affinity);
   dt_bauhaus_slider_set(g->neutral_zone, p->neutral_zone);
+  dt_bauhaus_slider_set(g->neutral_falloff, p->neutral_falloff);
   dt_bauhaus_slider_set(g->priority, p->priority);
   dt_bauhaus_slider_set(g->conv_h, p->conv_h); dt_bauhaus_slider_set(g->aff_h, p->aff_h);
   dt_bauhaus_slider_set(g->nz_h, p->nz_h); dt_bauhaus_slider_set(g->prio_h, p->prio_h);
@@ -1579,6 +1589,10 @@ void gui_init(dt_iop_module_t *self)
                                             "act only on the drift (core size = neutral zone)."));
   g->neutral_zone = dt_bauhaus_slider_from_params(self, "neutral_zone");
   gtk_widget_set_tooltip_text(g->neutral_zone, _("radius of the preserved core (with negative affinity)."));
+  g->neutral_falloff = dt_bauhaus_slider_from_params(self, "neutral_falloff");
+  gtk_widget_set_tooltip_text(g->neutral_falloff, _("softness of the transition out of the preserved core.\n"
+                                                   "low = crisp edge (visible transition); high = gentle\n"
+                                                   "gradient. raise it if the neutral zone shows a hard seam."));
   g->priority = dt_bauhaus_slider_from_params(self, "priority");
   gtk_widget_set_tooltip_text(g->priority, _("bias the move toward one side of the target. 0 = symmetric."));
 
