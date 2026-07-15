@@ -167,11 +167,10 @@ typedef struct dt_iop_colorwarp_nodedata_t
 {
   float strength;
   float hc;              // selected hue centre (radians)
-  float hw_h, sigma_h;   // hue plateau half-width + shoulder sigma (radians, symmetric)
-  float hw_s_lo, hw_s_hi; // saturation plateau half-widths per side (canvas units)
+  float hw_h, sigma_h;   // hue plateau half-width + shoulder sigma (radians)
+  float hw_s, sat_sigma; // saturation plateau half-width + shoulder sigma (canvas units)
   float light_center;    // selected lightness centre (canvas / dt UCS J [0,1])
-  float hw_l_lo, hw_l_hi; // lightness plateau half-widths per side (canvas units)
-  float feather;         // shoulder width = feather * hw / 2
+  float hw_l, light_sigma; // lightness plateau half-width + shoulder sigma (canvas units)
   float guard2;          // neutral-protection guard, squared (dt UCS S)
   int invert;            // invert the whole selection
   float sel_hue;         // selection centre hue (turns [0,1])
@@ -250,16 +249,6 @@ static inline float _cw_band_w(const float ad, const float hw, const float inv_2
 {
   const float e = fmaxf(ad - hw, 0.0f);
   return expf(-(e * e) * inv_2sig2);
-}
-
-// asymmetric variant: plateau half-width depends on the side (signed distance d = value-centre),
-// shoulder = feather*hw/2. used for the bounded sat/light axes anchored per side.
-static inline float _cw_band_w2(const float d, const float hw_lo, const float hw_hi, const float f)
-{
-  const float hw = (d < 0.0f) ? hw_lo : hw_hi;
-  const float sig = fmaxf(f * hw * 0.5f, 1e-4f);
-  const float e = fmaxf(fabsf(d) - hw, 0.0f);
-  return expf(-(e * e) / (2.0f * sig * sig));
 }
 
 // invert the dt UCS saturation metric S = C/(J*(C^1.336+1)) for C, given S and J.
@@ -415,9 +404,10 @@ void process(dt_iop_module_t *self,
 
     const float hc = nd->hc, hw_h = nd->hw_h;
     const float inv_2sh2 = 1.0f / (2.0f * nd->sigma_h * nd->sigma_h);
-    const float sat_c = nd->sel_sat, hw_s_lo = nd->hw_s_lo, hw_s_hi = nd->hw_s_hi;
-    const float light_center = nd->light_center, hw_l_lo = nd->hw_l_lo, hw_l_hi = nd->hw_l_hi;
-    const float f = nd->feather;
+    const float sat_c = nd->sel_sat, hw_s = nd->hw_s;
+    const float inv_2ss2 = 1.0f / (2.0f * nd->sat_sigma * nd->sat_sigma);
+    const float light_center = nd->light_center, hw_l = nd->hw_l;
+    const float inv_2sl2 = 1.0f / (2.0f * nd->light_sigma * nd->light_sigma);
     const float guard2 = nd->guard2;
     const int invert = nd->invert;
 
@@ -435,11 +425,11 @@ void process(dt_iop_module_t *self,
         J = JCH[0]; h = JCH[2];
         sat = (J > 1e-6f) ? JCH[1] / (J * (powf(JCH[1], 1.33654221029386f) + 1.0f)) : 0.0f;
       }
-      const float sat_p = sqrtf(fmaxf(sat, 0.0f) / 0.1f);   // canvas saturation [0, ~1.5]
+      const float sat_p = sqrtf(fmaxf(sat, 0.0f) / 0.1f);   // canvas saturation
       const float dh = fabsf(atan2f(sinf(h - hc), cosf(h - hc)));
       const float hue_w = _cw_band_w(dh, hw_h, inv_2sh2);
-      const float sat_w = _cw_band_w2(sat_p - sat_c, hw_s_lo, hw_s_hi, f);
-      const float light_w = _cw_band_w2(J - light_center, hw_l_lo, hw_l_hi, f);
+      const float sat_w = _cw_band_w(fabsf(sat_p - sat_c), hw_s, inv_2ss2);
+      const float light_w = _cw_band_w(fabsf(J - light_center), hw_l, inv_2sl2);
       float sel = hue_w * sat_w * light_w;
       if(invert) sel = 1.0f - sel;
       // neutral protection: fade near-neutral pixels (noisy hue); guard2==0 -> off
@@ -672,19 +662,18 @@ static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_
 {
   nd->strength = n->strength;
   nd->hc = n->center_hue * (2.0f * M_PI_F) - M_PI_F;   // [0,1] -> [-pi,pi]
-  // sat & light select in CANVAS units (what the wheel shows), with per-side plateau
-  // half-widths anchored to each bound: low = range*(centre-min), high = range*(max-centre).
-  // range=1 -> the band exactly fills [min,max] from any centre; range=0 -> a point. both
-  // edges move proportionally toward their bound. hue is periodic (symmetric reach*pi). the
-  // shoulder is a fraction of the plateau (feather*hw/2) so a tight range stays tight.
-  nd->feather = CLAMP(n->feather, 0.0f, 1.0f);
-  nd->hw_h = n->reach * M_PI_F;   nd->sigma_h = fmaxf(nd->feather * nd->hw_h * 0.5f, 1e-3f);
-  const float smax = 1.5f;   // canvas saturation of the most vivid colours
-  nd->hw_s_lo = n->sat_range * n->select_sat;
-  nd->hw_s_hi = n->sat_range * (smax - n->select_sat);
+  // sat & light select in CANVAS units (what the wheel shows). the plateau is SYMMETRIC
+  // around the centre (so the white dot sits in the middle of the band), with half-width
+  // anchored to the farther bound: hw = range * max(centre-min, max-centre). range=1 reaches
+  // the far bound and over-reaches (clamps) the near one -> covers the whole axis from any
+  // centre; range=0 -> a point. hue is periodic (reach*pi). shoulder = feather*hw/2.
+  const float f = CLAMP(n->feather, 0.0f, 1.0f);
+  nd->hw_h = n->reach * M_PI_F;   nd->sigma_h = fmaxf(f * nd->hw_h * 0.5f, 1e-3f);
+  nd->hw_s = n->sat_range * fmaxf(n->select_sat, 1.0f - n->select_sat);
+  nd->sat_sigma = fmaxf(f * nd->hw_s * 0.5f, 1e-3f);
   nd->light_center = n->select_light;
-  nd->hw_l_lo = n->light_range * n->select_light;
-  nd->hw_l_hi = n->light_range * (1.0f - n->select_light);
+  nd->hw_l = n->light_range * fmaxf(n->select_light, 1.0f - n->select_light);
+  nd->light_sigma = fmaxf(f * nd->hw_l * 0.5f, 1e-3f);
   // neutral protection now fully user-controlled: 0 = off (can select even neutrals)
   const float guard = CLAMP(n->neutral_protect, 0.0f, 1.0f) * 0.06f;
   nd->guard2 = guard * guard;
@@ -978,15 +967,16 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
   cairo_set_dash(cr, dash, 2, 0);
   cairo_set_source_rgba(cr, 1, 1, 1, 0.8);
   cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.2));
-  // per-side anchored band edges (canvas units), matching the engine: range=1 fills [0,bmax]
+  // symmetric anchored band edges (canvas units), matching the engine: the centre sits in
+  // the middle, hw = range*max(centre, 1-centre) so range=1 fills [0,1] from any centre.
   if(mode != 2)   // annular sector
   {
     const double dh = CLAMP(p->reach * 0.5, 0.0, 0.5) * 2.0 * M_PI;
     const double bc = (mode == 0) ? p->select_sat : p->select_light;
     const double br = (mode == 0) ? p->sat_range : p->light_range;
-    const double bmax = (mode == 0) ? 1.5 : 1.0;
-    const double r0 = CLAMP(bc - br * bc, 0.0, 1.0) * R;
-    const double r1 = CLAMP(bc + br * (bmax - bc), 0.0, 1.0) * R;
+    const double hw = br * fmax(bc, 1.0 - bc);
+    const double r0 = CLAMP(bc - hw, 0.0, 1.0) * R;
+    const double r1 = CLAMP(bc + hw, 0.0, 1.0) * R;
     const double ac = -2.0 * M_PI * p->center_hue;
     cairo_new_path(cr);
     cairo_arc(cr, cx, cy, r1, ac - dh, ac + dh);
@@ -996,11 +986,11 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
   }
   else            // rectangle
   {
+    const double hws = p->sat_range * fmax(p->select_sat, 1.0 - p->select_sat);
+    const double hwl = p->light_range * fmax(p->select_light, 1.0 - p->select_light);
     double x0, y0, x1, y1;
-    _cw_ab_pt(2, CLAMP(p->select_sat - p->sat_range * p->select_sat, 0.0, 1.0),
-              CLAMP(p->select_light - p->light_range * p->select_light, 0.0, 1.0), cx, cy, R, &x0, &y0);
-    _cw_ab_pt(2, CLAMP(p->select_sat + p->sat_range * (1.5 - p->select_sat), 0.0, 1.0),
-              CLAMP(p->select_light + p->light_range * (1.0 - p->select_light), 0.0, 1.0), cx, cy, R, &x1, &y1);
+    _cw_ab_pt(2, CLAMP(p->select_sat - hws, 0.0, 1.0), CLAMP(p->select_light - hwl, 0.0, 1.0), cx, cy, R, &x0, &y0);
+    _cw_ab_pt(2, CLAMP(p->select_sat + hws, 0.0, 1.0), CLAMP(p->select_light + hwl, 0.0, 1.0), cx, cy, R, &x1, &y1);
     cairo_rectangle(cr, fmin(x0, x1), fmin(y0, y1), fabs(x1 - x0), fabs(y1 - y0));
     cairo_stroke(cr);
   }
