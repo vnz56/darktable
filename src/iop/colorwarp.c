@@ -1609,6 +1609,13 @@ void gui_init(dt_iop_module_t *self)
 
   self->widget = box;   // restore the module root container
 
+  // dt_gui_new_collapsible_section() packs with pack_end (reverse order); reorder the four
+  // sections so they read top-to-bottom selection -> move -> affinity -> refine
+  gtk_box_reorder_child(GTK_BOX(box), g->refine_cs.expander, -1);
+  gtk_box_reorder_child(GTK_BOX(box), g->affinity_cs.expander, -1);
+  gtk_box_reorder_child(GTK_BOX(box), g->move_cs.expander, -1);
+  gtk_box_reorder_child(GTK_BOX(box), g->selection_cs.expander, -1);
+
   // start on the affinity page that matches the saved mode
   gtk_notebook_set_current_page(g->aff_notebook,
                                 ((dt_iop_colorwarp_params_t *)self->params)->per_component ? 1 : 0);
