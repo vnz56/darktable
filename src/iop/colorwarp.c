@@ -54,6 +54,10 @@
 DT_MODULE_INTROSPECTION(1, dt_iop_colorwarp_params_t)
 
 #define CW_MAX_NODES 8
+// display-only rotation of the wheel (radians) to line the hues up with darktable's Jz
+// vectorscope orientation. dt UCS != Jz so it is a best-fit, not an exact match; angles
+// (= dt UCS hue) are unchanged, only the on-screen orientation rotates. ~ -85 deg visual.
+#define CW_WHEEL_ROT 1.4835f
 
 // one attractor node: everything that defines a selection + its directed move.
 // (mirrors the flat "scratch" fields below, which are the live editor for the active node)
@@ -860,7 +864,7 @@ static void _cw_ab_pt(int mode, double a, double b, double cx, double cy, double
                       double *X, double *Y)
 {
   if(mode == 2) { *X = cx + (a * 2.0 - 1.0) * R; *Y = cy - (b * 2.0 - 1.0) * R; }  // panel
-  else { const double ang = -2.0 * M_PI * a; *X = cx + cos(ang) * R * b; *Y = cy + sin(ang) * R * b; }
+  else { const double ang = -2.0 * M_PI * a + CW_WHEEL_ROT; *X = cx + cos(ang) * R * b; *Y = cy + sin(ang) * R * b; }
 }
 // screen point -> (a,b)
 static void _cw_xy_ab(int mode, double x, double y, double cx, double cy, double R,
@@ -874,9 +878,9 @@ static void _cw_xy_ab(int mode, double x, double y, double cx, double cy, double
   else
   {
     const double dx = x - cx, dy = y - cy;
-    double ang = atan2(-dy, dx);
-    if(ang < 0) ang += 2.0 * M_PI;
-    *a = ang / (2.0 * M_PI);
+    double av = (atan2(-dy, dx) + CW_WHEEL_ROT) / (2.0 * M_PI);
+    av -= floor(av);
+    *a = av;
     *b = CLAMP(hypot(dx, dy) / R, 0.0, 1.0);
   }
 }
@@ -954,7 +958,7 @@ static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, fl
       {
         const float rr = sqrtf(dx * dx + dy * dy) / Ri;
         if(rr > 1.0f) { pix[0] = pix[1] = pix[2] = pix[3] = 0; continue; }
-        float a = -atan2f(dy, dx) / (2.f * M_PI_F); a -= floorf(a);   // hue turn
+        float a = (CW_WHEEL_ROT - atan2f(dy, dx)) / (2.f * M_PI_F); a -= floorf(a);   // hue turn
         h = a * 2.f * M_PI_F - M_PI_F;
         if(mode == 0) { J = 0.72f; C = _cw_S_to_C(rr * rr * 0.1f, J); }        // sat wheel
         else          { J = fmaxf(rr, 1e-3f); C = _cw_S_to_C(0.05f, J); }      // lightness wheel
@@ -1042,7 +1046,7 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
     const double hw = br * fmax(bc, 1.0 - bc);
     const double r0 = CLAMP(bc - hw, 0.0, 1.0) * R;
     const double r1 = CLAMP(bc + hw, 0.0, 1.0) * R;
-    const double ac = -2.0 * M_PI * p->center_hue;
+    const double ac = -2.0 * M_PI * p->center_hue + CW_WHEEL_ROT;
     cairo_new_path(cr);
     cairo_arc(cr, cx, cy, r1, ac - dh, ac + dh);
     cairo_arc_negative(cr, cx, cy, r0, ac + dh, ac - dh);
