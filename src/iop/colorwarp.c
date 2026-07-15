@@ -174,7 +174,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   int view_all;           // "all nodes" preview: mask spans every node (union), not just active
   int drag;               // 0=none, 1=source, 2=target
   cairo_surface_t *wheel_cache;   // rendered canvas background (dt UCS -> sRGB), cached
-  int cache_mode, cache_R;
+  int cache_mode, cache_R, cache_sc;
   float cache_hue;
 } dt_iop_colorwarp_gui_data_t;
 
@@ -943,14 +943,19 @@ static inline float _cw_dither(int px, int py)
 
 // paint the canvas background from real dt UCS colours (angle = dt UCS hue, so it matches
 // the engine exactly); pixel-accurate and smooth, unlike the old vivid-sRGB mesh.
-static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, float L_white)
+// rendered at DEVICE resolution (sc = HiDPI scale factor) so the dither lands on real screen
+// pixels; if it were rendered at logical size the OS would upscale-interpolate it and average
+// the dither away, bringing the banding rings back.
+static cairo_surface_t *_cw_render_canvas(int mode, int Ri, int sc, float select_hue, float L_white)
 {
-  const int D = 2 * Ri;
+  const float Rf = (float)Ri;             // logical radius
+  const int D = 2 * Ri * sc;              // device pixels
   cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, D, D);
   if(cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) return surf;
   unsigned char *const data = cairo_image_surface_get_data(surf);
   const int stride = cairo_image_surface_get_stride(surf);
   const float sel_h = select_hue * 2.f * M_PI_F - M_PI_F;
+  const float inv_sc = 1.0f / (float)sc;
   DT_OMP_FOR()
   for(int py = 0; py < D; py++)
   {
@@ -958,17 +963,17 @@ static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, fl
     for(int px = 0; px < D; px++)
     {
       unsigned char *pix = row + px * 4;
-      const float dx = px - Ri + 0.5f, dy = py - Ri + 0.5f;
+      const float dx = (px + 0.5f) * inv_sc - Rf, dy = (py + 0.5f) * inv_sc - Rf;   // logical
       float J, C, h;
       if(mode == 2)   // panel: x = saturation, y = lightness, fixed hue
       {
-        const float a = CLAMP((dx / Ri) * 0.5f + 0.5f, 0.f, 1.f);   // saturation [0,1]
-        const float b = CLAMP(-(dy / Ri) * 0.5f + 0.5f, 0.f, 1.f);  // lightness  [0,1]
+        const float a = CLAMP((dx / Rf) * 0.5f + 0.5f, 0.f, 1.f);   // saturation [0,1]
+        const float b = CLAMP(-(dy / Rf) * 0.5f + 0.5f, 0.f, 1.f);  // lightness  [0,1]
         J = b; C = _cw_S_to_C(a * a * 0.1f, fmaxf(J, 1e-3f)); h = sel_h;
       }
       else            // wheel: angle = dt UCS hue, radius = saturation (0) or lightness (1)
       {
-        const float rr = sqrtf(dx * dx + dy * dy) / Ri;
+        const float rr = sqrtf(dx * dx + dy * dy) / Rf;
         if(rr > 1.0f) { pix[0] = pix[1] = pix[2] = pix[3] = 0; continue; }
         float a = (CW_WHEEL_ROT - atan2f(dy, dx)) / (2.f * M_PI_F); a -= floorf(a);   // hue turn
         h = a * 2.f * M_PI_F - M_PI_F;
@@ -988,21 +993,22 @@ static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, fl
       pix[3] = 255;
     }
   }
+  cairo_surface_set_device_scale(surf, sc, sc);   // present the device-res surface at Ri logical
   cairo_surface_mark_dirty(surf);
   return surf;
 }
 
-// cached accessor: re-render only when the mode, size, or (panel) hue changes
+// cached accessor: re-render only when the mode, size, scale, or (panel) hue changes
 static cairo_surface_t *_cw_canvas_surface(dt_iop_colorwarp_gui_data_t *g, int mode, int Ri,
-                                           float select_hue, float L_white)
+                                           int sc, float select_hue, float L_white)
 {
   const float key_hue = (mode == 2) ? select_hue : 0.f;
-  if(g->wheel_cache && g->cache_mode == mode && g->cache_R == Ri
+  if(g->wheel_cache && g->cache_mode == mode && g->cache_R == Ri && g->cache_sc == sc
      && fabsf(g->cache_hue - key_hue) < 1e-4f)
     return g->wheel_cache;
   if(g->wheel_cache) cairo_surface_destroy(g->wheel_cache);
-  g->wheel_cache = _cw_render_canvas(mode, Ri, select_hue, L_white);
-  g->cache_mode = mode; g->cache_R = Ri; g->cache_hue = key_hue;
+  g->wheel_cache = _cw_render_canvas(mode, Ri, sc, select_hue, L_white);
+  g->cache_mode = mode; g->cache_R = Ri; g->cache_sc = sc; g->cache_hue = key_hue;
   return g->wheel_cache;
 }
 
@@ -1020,7 +1026,8 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
   // real dt UCS colours, rendered pixel-accurate into a cached surface
   const float L_white = Y_to_dt_UCS_L_star(1.0f);
   const int Ri = (int)(R + 1.5);
-  cairo_surface_t *bg = _cw_canvas_surface(g, mode, Ri, p->center_hue, L_white);
+  const int sc = MAX(1, gtk_widget_get_scale_factor(widget));   // HiDPI: render at device res
+  cairo_surface_t *bg = _cw_canvas_surface(g, mode, Ri, sc, p->center_hue, L_white);
 
   if(mode != 2)   // WHEEL: hue = angle; radius = saturation (mode 0) or lightness (mode 1)
   {
