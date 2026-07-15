@@ -40,6 +40,7 @@
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
+#include "common/opencl.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
@@ -232,6 +233,11 @@ typedef struct dt_iop_colorwarp_data_t
   float input_smooth;    // pre-smoothing of the selection inputs (J + chromaticity) [0,1] (global)
   int polar_move;        // move mode: 1 = polar (hue rotation), 0 = Cartesian a/b slide (global)
 } dt_iop_colorwarp_data_t;
+
+typedef struct dt_iop_colorwarp_global_data_t
+{
+  int kernel_clear, kernel_build_mask, kernel_accumulate, kernel_apply;
+} dt_iop_colorwarp_global_data_t;
 
 
 const char *name()
@@ -725,6 +731,134 @@ void process(dt_iop_module_t *self,
   dt_free_align(acc_h); dt_free_align(acc_s); dt_free_align(acc_l); dt_free_align(sel_acc);
   dt_free_align(bJ); dt_free_align(bU); dt_free_align(bV);
 }
+
+#ifdef HAVE_OPENCL
+// pack a resolved node into the flat float array the kernels read (index map in colorwarp.cl)
+static void _cw_pack_node(const dt_iop_colorwarp_nodedata_t *nd, float P[42])
+{
+  P[0] = nd->strength; P[1] = nd->hc; P[2] = nd->hw_h; P[3] = nd->sigma_h;
+  P[4] = nd->sel_sat; P[5] = nd->hw_s; P[6] = nd->sat_sigma;
+  P[7] = nd->light_center; P[8] = nd->hw_l; P[9] = nd->light_sigma;
+  P[10] = nd->guard2; P[11] = (float)nd->invert;
+  P[12] = nd->sel_hue; P[13] = nd->shift_hue; P[14] = nd->shift_chroma; P[15] = nd->shift_lightness;
+  P[16] = nd->convergence; P[17] = nd->affinity; P[18] = nd->neutral_zone;
+  P[19] = nd->neutral_falloff; P[20] = nd->priority;
+  P[21] = nd->chroma_weight; P[22] = nd->luma_weight; P[23] = nd->preserve_texture;
+  P[24] = (float)nd->per_component;
+  P[25] = nd->conv_h; P[26] = nd->aff_h; P[27] = nd->nz_h; P[28] = nd->nzf_h; P[29] = nd->prio_h; P[30] = nd->cw_h;
+  P[31] = nd->conv_c; P[32] = nd->aff_c; P[33] = nd->nz_c; P[34] = nd->nzf_c; P[35] = nd->prio_c; P[36] = nd->lw_c;
+  P[37] = nd->conv_l; P[38] = nd->aff_l; P[39] = nd->nz_l; P[40] = nd->nzf_l; P[41] = nd->prio_l;
+}
+
+int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
+               const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorwarp_data_t *const d = piece->data;
+  const dt_iop_colorwarp_global_data_t *const gd = self->global_data;
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  if(piece->colors != 4 || !work_profile) return DT_OPENCL_PROCESS_CL;
+
+  const dt_iop_colorwarp_gui_data_t *const g = self->gui_data;
+  const int mask_mode = (g && dt_pipe_is_full(piece->pipe)) ? g->mask_mode : 0;
+  // phase 1: only the core grading path on GPU; the rest falls back to CPU
+  if(mask_mode != 0 || d->use_eigf || d->input_smooth > 0.f || d->corr_smooth > 0.f)
+    return DT_OPENCL_PROCESS_CL;
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_out->width, height = roi_out->height;
+  const float L_white = Y_to_dt_UCS_L_star(1.0f);
+  const int polar = d->polar_move;
+  const int gw = (int)(d->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
+
+  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+
+  dt_colormatrix_t input_matrix, output_matrix;
+  dt_colormatrix_mul(input_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+  cl_mem in_m = dt_opencl_copy_host_to_device_constant(devid, 12 * sizeof(float), input_matrix);
+  cl_mem out_m = dt_opencl_copy_host_to_device_constant(devid, 12 * sizeof(float), output_matrix);
+  cl_mem mask = dt_opencl_alloc_device(devid, width, height, sizeof(float));
+  cl_mem mask_f = dt_opencl_alloc_device(devid, width, height, sizeof(float));
+  const size_t bsize = (size_t)width * height * sizeof(float);
+  cl_mem acc_h = dt_opencl_alloc_device_buffer(devid, bsize);
+  cl_mem acc_s = dt_opencl_alloc_device_buffer(devid, bsize);
+  cl_mem acc_l = dt_opencl_alloc_device_buffer(devid, bsize);
+  cl_mem P_cl = NULL;
+
+  if(!in_m || !out_m || !mask || !mask_f || !acc_h || !acc_s || !acc_l) goto cleanup;
+
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_clear, width, height,
+        CLARG(acc_h), CLARG(acc_s), CLARG(acc_l), CLARG(width), CLARG(height));
+  if(err != CL_SUCCESS) goto cleanup;
+
+  for(int n = 0; n < d->num_nodes; n++)
+  {
+    const dt_iop_colorwarp_nodedata_t *const nd = &d->nd[n];
+    if(nd->strength <= 0.f) continue;
+    float P[42];
+    _cw_pack_node(nd, P);
+    P_cl = dt_opencl_copy_host_to_device_constant(devid, 42 * sizeof(float), P);
+    if(!P_cl) { err = CL_MEM_OBJECT_ALLOCATION_FAILURE; goto cleanup; }
+
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_build_mask, width, height,
+          CLARG(dev_in), CLARG(mask), CLARG(P_cl), CLARG(in_m), CLARG(L_white), CLARG(width), CLARG(height));
+    if(err != CL_SUCCESS) goto cleanup;
+
+    cl_mem selbuf = mask;
+    if(d->smoothing > 0.f && gw >= 1)
+    {
+      err = guided_filter_cl(devid, dev_in, mask, mask_f, width, height, 4, gw, d->edge_eps, 1.0f, 0.0f, 1.0f);
+      if(err != CL_SUCCESS) goto cleanup;
+      selbuf = mask_f;
+    }
+
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_accumulate, width, height,
+          CLARG(dev_in), CLARG(selbuf), CLARG(acc_h), CLARG(acc_s), CLARG(acc_l),
+          CLARG(P_cl), CLARG(in_m), CLARG(L_white), CLARG(polar), CLARG(width), CLARG(height));
+    if(err != CL_SUCCESS) goto cleanup;
+
+    dt_opencl_release_mem_object(P_cl); P_cl = NULL;
+  }
+
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_apply, width, height,
+        CLARG(dev_in), CLARG(dev_out), CLARG(acc_h), CLARG(acc_s), CLARG(acc_l),
+        CLARG(in_m), CLARG(out_m), CLARG(L_white), CLARG(polar), CLARG(width), CLARG(height));
+
+cleanup:
+  dt_opencl_release_mem_object(P_cl);
+  dt_opencl_release_mem_object(mask);
+  dt_opencl_release_mem_object(mask_f);
+  dt_opencl_release_mem_object(acc_h);
+  dt_opencl_release_mem_object(acc_s);
+  dt_opencl_release_mem_object(acc_l);
+  dt_opencl_release_mem_object(in_m);
+  dt_opencl_release_mem_object(out_m);
+  return err;
+}
+
+void init_global(dt_iop_module_so_t *self)
+{
+  const int program = 43;   // colorwarp.cl, from programs.conf
+  dt_iop_colorwarp_global_data_t *gd = malloc(sizeof(dt_iop_colorwarp_global_data_t));
+  self->data = gd;
+  gd->kernel_clear = dt_opencl_create_kernel(program, "colorwarp_clear");
+  gd->kernel_build_mask = dt_opencl_create_kernel(program, "colorwarp_build_mask");
+  gd->kernel_accumulate = dt_opencl_create_kernel(program, "colorwarp_accumulate");
+  gd->kernel_apply = dt_opencl_create_kernel(program, "colorwarp_apply");
+}
+
+void cleanup_global(dt_iop_module_so_t *self)
+{
+  const dt_iop_colorwarp_global_data_t *gd = self->data;
+  dt_opencl_free_kernel(gd->kernel_clear);
+  dt_opencl_free_kernel(gd->kernel_build_mask);
+  dt_opencl_free_kernel(gd->kernel_accumulate);
+  dt_opencl_free_kernel(gd->kernel_apply);
+  free(self->data);
+  self->data = NULL;
+}
+#endif // HAVE_OPENCL
 
 // resolve a raw params node into process-ready values (band sigmas, centre coords, ...)
 static void _cw_resolve_node(const dt_iop_colorwarp_node_t *n, dt_iop_colorwarp_nodedata_t *nd)
