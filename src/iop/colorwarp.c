@@ -157,7 +157,6 @@ typedef struct dt_iop_colorwarp_params_t
   float edge;             // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.3 $DESCRIPTION: "edge threshold"
   gboolean use_eigf;      // $DEFAULT: FALSE $DESCRIPTION: "exposure-independent filter"
   float corr_smooth;      // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "correction smoothing"
-  float input_smooth;     // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.0 $DESCRIPTION: "denoise selection input"
   gboolean polar_move;    // $DEFAULT: TRUE $DESCRIPTION: "hue rotation (polar)"
   // --- multi-node (field): the flat fields above are the live editor for node[active_node] ---
   int num_nodes;          // $MIN: 1 $MAX: 8 $DEFAULT: 1 $DESCRIPTION: "nodes"
@@ -170,7 +169,7 @@ typedef struct dt_iop_colorwarp_gui_data_t
   GtkWidget *strength, *center_hue, *reach, *select_sat, *sat_range, *select_light, *light_range, *invert;
   GtkWidget *feather, *neutral_protect;
   GtkWidget *shift_hue, *shift_chroma, *shift_lightness, *convergence, *affinity;
-  GtkWidget *neutral_zone, *neutral_falloff, *priority, *absolute_target, *smoothing, *edge, *use_eigf, *corr_smooth, *input_smooth;
+  GtkWidget *neutral_zone, *neutral_falloff, *priority, *absolute_target, *smoothing, *edge, *use_eigf, *corr_smooth;
   GtkWidget *polar_move;
   GtkNotebook *aff_notebook;   // affinity: global + per-component pages
   GtkWidget *conv_h, *aff_h, *nz_h, *nzf_h, *prio_h, *cw_h;
@@ -230,7 +229,6 @@ typedef struct dt_iop_colorwarp_data_t
   int use_eigf;          // mask filter: 0=guided (image), 1=EIGF (exposure-independent) (global)
   float eigf_feather;    // EIGF feathering, derived from the edge slider (global)
   float corr_smooth;     // spatial smoothing of the accumulated move [0,1] (global)
-  float input_smooth;    // pre-smoothing of the selection inputs (J + chromaticity) [0,1] (global)
   int polar_move;        // move mode: 1 = polar (hue rotation), 0 = Cartesian a/b slide (global)
 } dt_iop_colorwarp_data_t;
 
@@ -416,50 +414,6 @@ void process(dt_iop_module_t *self,
 
   const int gw = (int)(d->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
 
-  // optional: pre-smooth the selection inputs (J + chromaticity) so the mask is built from
-  // denoised data -> clean selections in noisy low-chroma shadows. shared by all nodes (also
-  // spares the per-node JCH recompute). opt-in: allocates 3 buffers (RAM), 0 = off.
-  const float *restrict PJ = NULL, *restrict PH = NULL, *restrict PS = NULL;
-  float *restrict bJ = NULL, *restrict bU = NULL, *restrict bV = NULL;
-  const int pw = (int)(d->input_smooth * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale) + 0.5f);
-  if(d->input_smooth > 0.f && pw >= 1)
-  {
-    bJ = dt_alloc_align_float(npixels);
-    bU = dt_alloc_align_float(npixels);
-    bV = dt_alloc_align_float(npixels);
-    if(bJ && bU && bV)
-    {
-      DT_OMP_FOR()
-      for(size_t k = 0; k < npixels; k++)
-      {
-        const float *const restrict in = (const float *)ivoid + 4 * k;
-        const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
-        dt_aligned_pixel_t JCH;
-        dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
-        bJ[k] = JCH[0];                          // lightness J
-        bU[k] = JCH[1] * cosf(JCH[2]);           // chromaticity vector (blur-safe for hue,
-        bV[k] = JCH[1] * sinf(JCH[2]);           //  averages out low-chroma hue noise)
-      }
-      float *const restrict bufs[3] = { bJ, bU, bV };
-      for(int c = 0; c < 3; c++)
-      {
-        guided_filter(ivoid, bufs[c], mask_f, W, H, 4, pw, d->edge_eps, 1.0f, 0.0f, 1.0f);
-        DT_OMP_FOR()
-        for(size_t k = 0; k < npixels; k++) bufs[c][k] = mask_f[k];
-      }
-      // derive smoothed hue + saturation in place: bU <- hue, bV <- saturation
-      DT_OMP_FOR()
-      for(size_t k = 0; k < npixels; k++)
-      {
-        const float J = bJ[k];
-        const float C = hypotf(bU[k], bV[k]);
-        bU[k] = atan2f(bV[k], bU[k]);
-        bV[k] = (J > 1e-6f) ? C / (J * (powf(C, 1.33654221029386f) + 1.0f)) : 0.0f;
-      }
-      PJ = bJ; PH = bU; PS = bV;
-    }
-  }
-
   // --- per node: build its mask, smooth it, accumulate its move (superposition field) ---
   for(int n = 0; n < d->num_nodes; n++)
   {
@@ -479,18 +433,18 @@ void process(dt_iop_module_t *self,
     DT_OMP_FOR()
     for(size_t k = 0; k < npixels; k++)
     {
-      float J, sat, h;
-      if(PJ) { J = PJ[k]; h = PH[k]; sat = PS[k]; }   // pre-smoothed selection inputs
-      else
-      {
-        const float *const restrict in = (const float *)ivoid + 4 * k;
-        const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
-        dt_aligned_pixel_t JCH;
-        dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
-        J = JCH[0]; h = JCH[2];
-        sat = (J > 1e-6f) ? JCH[1] / (J * (powf(JCH[1], 1.33654221029386f) + 1.0f)) : 0.0f;
-      }
-      const float sat_p = sqrtf(fmaxf(sat, 0.0f) / 0.1f);   // canvas saturation
+      const float *const restrict in = (const float *)ivoid + 4 * k;
+      const dt_aligned_pixel_t px_rgb = { in[0], in[1], in[2], 0.f };
+      dt_aligned_pixel_t JCH;
+      dt_ioppr_rgb_matrix_to_dt_UCS_JCH(px_rgb, JCH, work_profile->matrix_in_transposed, L_white);
+      const float J = JCH[0], h = JCH[2];
+      const float sat = (J > 1e-6f) ? JCH[1] / (J * (powf(JCH[1], 1.33654221029386f) + 1.0f)) : 0.0f;
+      // chroma can exceed the canvas rim (sat_p can reach ~4 for deep-saturated pixels).
+      // for SELECTION we clamp to the rim: everything at/beyond the visible edge is treated
+      // as sitting on it, so range=1 covers the whole axis from any centre (and moving the
+      // centre no longer changes which super-saturated pixels are in). the rim is the visible
+      // max; off-canvas chroma has nowhere else to sit. move/reconstruction keep the raw value.
+      const float sat_p = fminf(sqrtf(fmaxf(sat, 0.0f) / 0.1f), 1.0f);   // canvas saturation (rim-clamped)
       const float dh = fabsf(atan2f(sinf(h - hc), cosf(h - hc)));
       const float hue_w = _cw_band_w(dh, hw_h, inv_2sh2);
       const float sat_w = _cw_band_w(fabsf(sat_p - sat_c), hw_s, inv_2ss2);
@@ -737,7 +691,6 @@ void process(dt_iop_module_t *self,
 
   dt_free_align(mask); dt_free_align(mask_f);
   dt_free_align(acc_h); dt_free_align(acc_s); dt_free_align(acc_l); dt_free_align(sel_acc);
-  dt_free_align(bJ); dt_free_align(bU); dt_free_align(bV);
 }
 
 #ifdef HAVE_OPENCL
@@ -1009,7 +962,6 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
   // EIGF feathering: high edge slider = preserve edges (low feathering), low = smooth across
   d->eigf_feather = CLAMP(powf(10.0f, (0.5f - p->edge) * 3.0f), 0.02f, 100.0f);
   d->corr_smooth = p->corr_smooth;
-  d->input_smooth = p->input_smooth;
   d->polar_move = p->polar_move ? 1 : 0;
 }
 
@@ -2024,13 +1976,6 @@ void gui_init(dt_iop_module_t *self)
                                                 "(not just the selection). cuts the noise that converge,\n"
                                                 "priority and affinity pick up from per-pixel values in\n"
                                                 "low-chroma shadows. 0 = off (no extra cost)."));
-
-  g->input_smooth = dt_bauhaus_slider_from_params(self, "input_smooth");
-  gtk_widget_set_tooltip_text(g->input_smooth, _("denoise the data the selection is built from (lightness\n"
-                                                 "and chromaticity) before thresholding, so a partial\n"
-                                                 "selection in noisy low-chroma shadows stays clean at\n"
-                                                 "its edges. best fix for shadow speckle; 0 = off\n"
-                                                 "(otherwise allocates working buffers)."));
 
   self->widget = box;   // restore the module root container
 

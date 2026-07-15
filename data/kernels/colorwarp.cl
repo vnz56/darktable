@@ -130,7 +130,9 @@ kernel void colorwarp_build_mask(read_only image2d_t in, write_only image2d_t ma
   const float4 JCH = _cw_rgb_to_jch(rgb, M, L_white);
   const float J = JCH.x, C = JCH.y, hh = JCH.z;
   const float S = (J > 1e-6f) ? C / (J * (dtcl_pow(C, CW_CEXP) + 1.0f)) : 0.0f;
-  const float sat_p = sqrt(fmax(S, 0.0f) / 0.1f);
+  // rim-clamp for selection: chroma can exceed the canvas edge (sat_p ~4); treat everything
+  // at/beyond the rim as on it so range=1 covers the whole axis from any centre (matches CPU).
+  const float sat_p = fmin(sqrt(fmax(S, 0.0f) / 0.1f), 1.0f);
   const float dh = fabs(atan2(sin(hh - P[1]), cos(hh - P[1])));
   const float hue_w = _cw_band_w(dh, P[2], 1.0f / (2.0f * P[3] * P[3]));
   const float sat_w = _cw_band_w(fabs(sat_p - P[4]), P[5], 1.0f / (2.0f * P[6] * P[6]));
