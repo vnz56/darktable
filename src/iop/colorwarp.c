@@ -1016,6 +1016,31 @@ static gboolean _cw_draw(GtkWidget *widget, cairo_t *cr, dt_iop_module_t *self)
   return FALSE;
 }
 
+static inline float _cw_wrap01(float x) { return x - floorf(x); }
+
+// the "shift hue" slider shows the ABSOLUTE target hue (center + shift), matching the black
+// dot on the canvas; the stored param stays a relative offset. these bridge the two.
+static void _cw_refresh_target_hue(dt_iop_module_t *self)
+{
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  dt_iop_colorwarp_params_t *p = self->params;
+  ++darktable.gui->reset;
+  dt_bauhaus_slider_set(g->shift_hue, _cw_wrap01(p->center_hue + p->shift_hue));
+  --darktable.gui->reset;
+}
+
+static void _cw_shift_hue_changed(GtkWidget *w, dt_iop_module_t *self)
+{
+  if(darktable.gui->reset) return;
+  dt_iop_colorwarp_gui_data_t *g = self->gui_data;
+  dt_iop_colorwarp_params_t *p = self->params;
+  float sh = dt_bauhaus_slider_get(w) - p->center_hue;   // absolute target -> relative offset
+  sh -= roundf(sh);
+  p->shift_hue = CLAMP(sh, -0.5f, 0.5f);
+  if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+}
+
 static void _cw_set_from_xy(dt_iop_module_t *self, double x, double y, int which)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
@@ -1031,27 +1056,26 @@ static void _cw_set_from_xy(dt_iop_module_t *self, double x, double y, int which
   if(which == 1)   // source: move the selection centre(s); with absolute target, keep target fixed
   {
     const gboolean abso = p->absolute_target;
+    const double old_tgt_h = p->center_hue + p->shift_hue;   // absolute target hue, kept if abso
     if(mode == 0)
     {
-      const double dc_h = a - p->center_hue, dc_s = b - p->select_sat;
+      const double dc_s = b - p->select_sat;
       dt_bauhaus_slider_set(g->center_hue, a);
       dt_bauhaus_slider_set(g->select_sat, b);
       if(abso)
       {
-        double sh = p->shift_hue - dc_h; sh -= round(sh);
-        dt_bauhaus_slider_set(g->shift_hue, CLAMP(sh, -0.5, 0.5));
+        dt_bauhaus_slider_set(g->shift_hue, _cw_wrap01(old_tgt_h));   // keep the target hue fixed
         dt_bauhaus_slider_set(g->shift_chroma, CLAMP(p->shift_chroma - dc_s, -1.0, 1.0));
       }
     }
     else if(mode == 1)
     {
-      const double dc_h = a - p->center_hue, dc_l = b - p->select_light;
+      const double dc_l = b - p->select_light;
       dt_bauhaus_slider_set(g->center_hue, a);
       dt_bauhaus_slider_set(g->select_light, b);
       if(abso)
       {
-        double sh = p->shift_hue - dc_h; sh -= round(sh);
-        dt_bauhaus_slider_set(g->shift_hue, CLAMP(sh, -0.5, 0.5));
+        dt_bauhaus_slider_set(g->shift_hue, _cw_wrap01(old_tgt_h));   // keep the target hue fixed
         dt_bauhaus_slider_set(g->shift_lightness, CLAMP(p->shift_lightness - dc_l, -1.0, 1.0));
       }
     }
@@ -1069,12 +1093,9 @@ static void _cw_set_from_xy(dt_iop_module_t *self, double x, double y, int which
   }
   else             // target: set the two shifts (relative to the source centre)
   {
-    if(mode == 0 || mode == 1)   // a is hue (angular, wraps)
+    if(mode == 0 || mode == 1)   // a is the absolute target hue (angular, wraps)
     {
-      double dhue = a - p->center_hue;
-      while(dhue > 0.5) dhue -= 1.0;
-      while(dhue < -0.5) dhue += 1.0;
-      dt_bauhaus_slider_set(g->shift_hue, CLAMP(dhue, -0.5, 0.5));
+      dt_bauhaus_slider_set(g->shift_hue, _cw_wrap01(a));   // slider shows the target hue directly
       if(mode == 0) dt_bauhaus_slider_set(g->shift_chroma, CLAMP(b - p->select_sat, -1.0, 1.0));
       else          dt_bauhaus_slider_set(g->shift_lightness, CLAMP(b - p->select_light, -1.0, 1.0));
     }
@@ -1206,7 +1227,7 @@ static void _cw_sync_sliders(dt_iop_module_t *self)
   dt_bauhaus_slider_set(g->feather, p->feather);
   dt_bauhaus_slider_set(g->neutral_protect, p->neutral_protect);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->invert), p->invert);
-  dt_bauhaus_slider_set(g->shift_hue, p->shift_hue);
+  dt_bauhaus_slider_set(g->shift_hue, _cw_wrap01(p->center_hue + p->shift_hue));   // absolute target hue
   dt_bauhaus_slider_set(g->shift_chroma, p->shift_chroma);
   dt_bauhaus_slider_set(g->shift_lightness, p->shift_lightness);
   dt_bauhaus_slider_set(g->convergence, p->convergence);
@@ -1322,7 +1343,10 @@ void gui_update(dt_iop_module_t *self)
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
   dt_iop_colorwarp_gui_data_t *g = self->gui_data;
-  if(g && g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  if(!g) return;
+  // the target-hue slider tracks center + shift, so refresh it when the centre moves
+  if(w == g->center_hue) _cw_refresh_target_hue(self);
+  if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
 }
 
 // eyedropper: grab the selected hue directly from an image pixel/area
@@ -1348,8 +1372,8 @@ void color_picker_apply(dt_iop_module_t *self, GtkWidget *picker, dt_dev_pixelpi
   {
     float sh = p->shift_hue - (new_ch - old_ch); sh -= roundf(sh);
     p->shift_hue = CLAMP(sh, -0.5f, 0.5f);
-    dt_bauhaus_slider_set(g->shift_hue, p->shift_hue);
   }
+  dt_bauhaus_slider_set(g->shift_hue, _cw_wrap01(p->center_hue + p->shift_hue));   // absolute target hue
   DT_LEAVE_GUI_UPDATE();
 
   if(g->area) gtk_widget_queue_draw(GTK_WIDGET(g->area));
@@ -1510,15 +1534,19 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_new_collapsible_section(&g->move_cs, "plugins/darkroom/colorwarp/expand_move",
                                  _("move"), GTK_BOX(box), DT_ACTION(self));
   self->widget = GTK_WIDGET(g->move_cs.container);
-  g->shift_hue = dt_bauhaus_slider_from_params(self, "shift_hue");
-  gtk_widget_set_tooltip_text(g->shift_hue, _("target hue to push the grabbed colours toward.\n"
-                                             "like 'select hue': right-click for the colour wheel.\n"
-                                             "(scaled by strength)"));
-  // same hue bar + colour-wheel popup as 'select hue' (span -180..+180 = a full turn)
+  // shift hue is a manual slider showing the ABSOLUTE target hue (= the black dot on the
+  // canvas); its callback converts back to the stored relative offset.
+  g->shift_hue = dt_bauhaus_slider_new_with_range(self, 0.0f, 1.0f, 0, 0.5f, 4);
+  dt_bauhaus_widget_set_label(g->shift_hue, NULL, N_("shift hue"));
+  gtk_widget_set_tooltip_text(g->shift_hue, _("target hue the grabbed colours are pushed toward\n"
+                                             "(the black dot on the canvas). shows the hue itself,\n"
+                                             "not an offset. right-click for the colour wheel."));
   dt_bauhaus_slider_set_format(g->shift_hue, "°");
   dt_bauhaus_slider_set_factor(g->shift_hue, 360.0f);
   dt_bauhaus_slider_set_feedback(g->shift_hue, 0);
   _cw_paint_hue_slider(g->shift_hue);
+  g_signal_connect(G_OBJECT(g->shift_hue), "value-changed", G_CALLBACK(_cw_shift_hue_changed), self);
+  gtk_box_pack_start(GTK_BOX(self->widget), g->shift_hue, FALSE, FALSE, 0);   // manual sliders need explicit packing
   g->shift_chroma = dt_bauhaus_slider_from_params(self, "shift_chroma");
   gtk_widget_set_tooltip_text(g->shift_chroma, _("change the grabbed colours' saturation (scaled by strength)"));
   g->shift_lightness = dt_bauhaus_slider_from_params(self, "shift_lightness");
