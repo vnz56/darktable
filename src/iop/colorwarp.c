@@ -763,7 +763,11 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   const int mask_mode = (g && dt_pipe_is_full(piece->pipe)) ? g->mask_mode : 0;
   // phase 1: only the core grading path on GPU; the rest falls back to CPU
   if(mask_mode != 0 || d->use_eigf || d->input_smooth > 0.f || d->corr_smooth > 0.f)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[colorwarp] CPU fallback (phase 1): mask_mode=%d eigf=%d input_smooth=%.2f corr_smooth=%.2f\n",
+             mask_mode, d->use_eigf, d->input_smooth, d->corr_smooth);
     return DT_OPENCL_PROCESS_CL;
+  }
 
   const int devid = piece->pipe->devid;
   const int width = roi_out->width, height = roi_out->height;
