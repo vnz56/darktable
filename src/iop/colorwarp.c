@@ -929,6 +929,18 @@ static void _cw_jch_to_srgb(float J, float C, float h, float L_white, float rgb[
   rgb[0] = powf(lr, 1.f / 2.2f); rgb[1] = powf(lg, 1.f / 2.2f); rgb[2] = powf(lb, 1.f / 2.2f);
 }
 
+// triangular-PDF dither, ~1 LSB peak, deterministic per pixel. added before the 8-bit
+// quantization to break the concentric quantization steps (which the eye amplifies into
+// phantom rings on a smooth radial gradient) into imperceptible noise.
+static inline float _cw_dither(int px, int py)
+{
+  unsigned int h = (unsigned int)(px * 73856093) ^ (unsigned int)(py * 19349663);
+  h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+  const float r1 = (h & 0xffffu) * (1.0f / 65535.0f);
+  const float r2 = ((h >> 16) & 0xffffu) * (1.0f / 65535.0f);
+  return r1 - r2;   // triangular in [-1, 1], zero mean
+}
+
 // paint the canvas background from real dt UCS colours (angle = dt UCS hue, so it matches
 // the engine exactly); pixel-accurate and smooth, unlike the old vivid-sRGB mesh.
 static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, float L_white)
@@ -969,9 +981,10 @@ static cairo_surface_t *_cw_render_canvas(int mode, int Ri, float select_hue, fl
       }
       float rgb[3];
       _cw_jch_to_srgb(J, C, h, L_white, rgb);
-      pix[0] = (unsigned char)(CLAMP(rgb[2], 0.f, 1.f) * 255.f + 0.5f);   // B
-      pix[1] = (unsigned char)(CLAMP(rgb[1], 0.f, 1.f) * 255.f + 0.5f);   // G
-      pix[2] = (unsigned char)(CLAMP(rgb[0], 0.f, 1.f) * 255.f + 0.5f);   // R
+      const float d = _cw_dither(px, py);   // ~1 LSB triangular dither -> no 8-bit banding rings
+      pix[0] = (unsigned char)CLAMP(rgb[2] * 255.f + d + 0.5f, 0.f, 255.f);   // B
+      pix[1] = (unsigned char)CLAMP(rgb[1] * 255.f + d + 0.5f, 0.f, 255.f);   // G
+      pix[2] = (unsigned char)CLAMP(rgb[0] * 255.f + d + 0.5f, 0.f, 255.f);   // R
       pix[3] = 255;
     }
   }
