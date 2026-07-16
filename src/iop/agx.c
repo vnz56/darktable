@@ -223,7 +223,7 @@ typedef struct dt_iop_agx_gui_data_t
 
   // --- Gamut (paper) compression + OOG diagnostic ---
   GtkWidget *gamut_profile;
-  GtkWidget *diag_toggle;
+  GtkWidget *diag_combo;
 
   // --- Mouse interaction on the curve ---
   gboolean dragging;
@@ -318,6 +318,8 @@ typedef struct primaries_params_t
 // hand-picked and threw away ~4.5% of boundary chroma everywhere (visible on the
 // yellows/deep reds of narrow mat papers). 0.99 recovers that and stays safe.
 #define AGX_GAMUT_SAFETY 0.99f
+// displacement diagnostic: delta-E histogram, 0.1 unit per bin (index AGX_DE_BINS = overflow)
+#define AGX_DE_BINS 120
 typedef struct dt_iop_agx_data_t
 {
   tone_mapping_params_t tone_mapping_params;
@@ -1700,6 +1702,23 @@ static inline void _agx_rgb_to_ych(const dt_aligned_pixel_t rgb, const dt_colorm
   *h = _agx_wrap_hue(atan2f(dg, dr) / (2.f * M_PI_F));
 }
 
+// working-space RGB -> CIE Lab (D50 PCS), for the displacement (delta-E) diagnostic
+static inline void _agx_rgb_to_lab(const dt_aligned_pixel_t rgb, const dt_colormatrix_t work_in_T,
+                                   float *L, float *A, float *B)
+{
+  dt_aligned_pixel_t xyz;
+  dt_apply_transposed_color_matrix(rgb, work_in_T, xyz); // -> XYZ D50 (darktable PCS)
+  const float xn = 0.9642f, yn = 1.0f, zn = 0.8249f;     // D50 white
+  const float x = xyz[0] / xn, y = xyz[1] / yn, z = xyz[2] / zn;
+  const float e = 216.f / 24389.f, k = 24389.f / 27.f;
+  const float fx = x > e ? cbrtf(x) : (k * x + 16.f) / 116.f;
+  const float fy = y > e ? cbrtf(y) : (k * y + 16.f) / 116.f;
+  const float fz = z > e ? cbrtf(z) : (k * z + 16.f) / 116.f;
+  *L = 116.f * fy - 16.f;
+  *A = 500.f * (fx - fy);
+  *B = 200.f * (fy - fz);
+}
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,
@@ -1754,8 +1773,17 @@ void process(dt_iop_module_t *self,
   // Out-of-gamut diagnostic overlay: full darkroom pipe only (never histogram/export).
   // Uses the SAME Yrg boundary LUT as the compressor -> they agree by construction.
   const gboolean do_diag = d->diag_mode > 0 && d->gamut_lut_valid && dt_pipe_is_full(piece->pipe);
+  const int disp_diag = do_diag && d->diag_mode == 2;   // displacement (delta-E) overlay
   float gamut_rn = 0.f, gamut_gn = 0.f;
   if(do_gamut || do_diag) _agx_yrg_neutral(&gamut_rn, &gamut_gn);
+  // two delta-E histograms: (a) pixels forced in (were out of gamut) vs (b) in-gamut pixels the
+  // soft knee moved anyway (the cost that arbitrates gamut_threshold). shared heap -> atomic add.
+  uint32_t *de_forced = NULL, *de_moved = NULL;
+  if(disp_diag)
+  {
+    de_forced = calloc(AGX_DE_BINS + 1, sizeof(uint32_t));
+    de_moved  = calloc(AGX_DE_BINS + 1, sizeof(uint32_t));
+  }
 
   DT_OMP_FOR()
   for(size_t k = 0; k < 4 * n_pixels; k += 4)
@@ -1793,6 +1821,10 @@ void process(dt_iop_module_t *self,
     // Convert from internal rendering space back to pipe working space
     dt_apply_transposed_color_matrix(rendering_rgb, rendering_to_pipe_transposed, pix_out);
 
+    // capture the pre-compression colour for the displacement diagnostic
+    dt_aligned_pixel_t pre_gamut;
+    if(disp_diag) copy_pixel(pre_gamut, pix_out);
+
     // Last op of this terminal module: compress chroma back into the paper gamut.
     if(do_gamut)
       _agx_apply_gamut(pix_out, d, d->gamut_amount, d->gamut_threshold,
@@ -1800,28 +1832,84 @@ void process(dt_iop_module_t *self,
                        pipe_work_profile->matrix_in_transposed,
                        pipe_work_profile->matrix_out_transposed);
 
-    // Out-of-gamut diagnostic overlay, on the *final* output (so it shows what
-    // remains OOG after any compression). Same Yrg boundary as the compressor:
-    //   Y out of [Ymin, Ymax]        -> luminance-OOG (desaturating cannot fix it)
-    //   Y in range but c > Cmax(h,Y) -> chroma-OOG    (desaturating fixes it)
-    if(do_diag)
+    if(disp_diag)
     {
+      // Displacement (delta-E) overlay: how far the compression actually moved each pixel,
+      // split into two populations that must never be aggregated:
+      //   (a) was out of gamut -> forced move (the compressor's job)      -> magenta ramp
+      //   (b) was in gamut, moved by the soft knee -> the transition cost  -> cyan ramp
+      // brightness scales with delta-E; unmoved pixels dim to grey for context.
+      float Yb, cb, hb;
+      _agx_rgb_to_ych(pre_gamut, pipe_work_profile->matrix_in_transposed, gamut_rn, gamut_gn, &Yb, &cb, &hb);
+      const int was_oog = cb > _agx_gamut_cmax(d, hb, Yb);
+      float Lb, Ab, Bb, La, Aa, Ba;
+      _agx_rgb_to_lab(pre_gamut, pipe_work_profile->matrix_in_transposed, &Lb, &Ab, &Bb);
+      _agx_rgb_to_lab(pix_out,   pipe_work_profile->matrix_in_transposed, &La, &Aa, &Ba);
+      const float dE = sqrtf((La - Lb) * (La - Lb) + (Aa - Ab) * (Aa - Ab) + (Ba - Bb) * (Ba - Bb));
+      if(dE > 0.05f)
+      {
+        const int bin = MIN((int)(dE / 0.1f), AGX_DE_BINS);
+        if(was_oog) { if(de_forced) { DT_OMP_PRAGMA(atomic update) de_forced[bin]++; } }
+        else        { if(de_moved)  { DT_OMP_PRAGMA(atomic update) de_moved[bin]++; } }
+        const float v = CLAMPF(dE / 5.0f, 0.f, 1.f);
+        if(was_oog) { pix_out[0] = v; pix_out[1] = 0.f; pix_out[2] = v; }   // magenta ramp
+        else        { pix_out[0] = 0.f; pix_out[1] = v; pix_out[2] = v; }   // cyan ramp
+      }
+      else
+      {
+        const float g = 0.35f * (0.2126f * pix_out[0] + 0.7152f * pix_out[1] + 0.0722f * pix_out[2]);
+        pix_out[0] = pix_out[1] = pix_out[2] = g;
+      }
+    }
+    else if(do_diag)
+    {
+      // Out-of-gamut overlay, on the *final* output (what remains OOG after any compression).
+      //   Y out of [Ymin, Ymax]        -> luminance-OOG (desaturating cannot fix it) -> orange
+      //   Y in range but c > Cmax(h,Y) -> chroma-OOG    (desaturating fixes it)      -> magenta
       float Y, c, h;
       _agx_rgb_to_ych(pix_out, pipe_work_profile->matrix_in_transposed, gamut_rn, gamut_gn, &Y, &c, &h);
-      // relative tolerance (paper black Y is itself tiny -> an absolute band would swallow it)
       if(Y < d->gamut_ymin * 0.98f || Y > d->gamut_ymax * 1.02f)
       {
-        pix_out[0] = 1.0f; pix_out[1] = 0.4f; pix_out[2] = 0.0f; // luminance-OOG: orange
+        pix_out[0] = 1.0f; pix_out[1] = 0.4f; pix_out[2] = 0.0f;
       }
       else if(c > _agx_gamut_cmax(d, h, Y))
       {
-        pix_out[0] = 1.0f; pix_out[1] = 0.0f; pix_out[2] = 1.0f; // chroma-OOG: magenta
+        pix_out[0] = 1.0f; pix_out[1] = 0.0f; pix_out[2] = 1.0f;
       }
     }
 
     // Copy over the alpha channel
     pix_out[3] = sanitised_in[3];
   }
+
+  if(disp_diag)
+  {
+    // report the two populations separately: aggregating them (or mean/max) hides the signal.
+    // area above delta-E 2 is the metric that matters (a coherent region at dE 2.5 is visible,
+    // an isolated pixel at dE 8 is not).
+    for(int pop = 0; pop < 2; pop++)
+    {
+      const uint32_t *const h = pop ? de_moved : de_forced;
+      const char *const nm = pop ? "knee-moved (in-gamut)" : "forced (was-OOG)  ";
+      if(!h) continue;
+      uint64_t cnt = 0, over2 = 0;
+      for(int b = 0; b <= AGX_DE_BINS; b++) { cnt += h[b]; if(b >= 20) over2 += h[b]; }
+      if(cnt == 0) { dt_print(DT_DEBUG_PIPE, "[agx displacement] %s none", nm); continue; }
+      float pc[3] = { 0.f, 0.f, 0.f }; const float q[3] = { 0.5f, 0.95f, 0.99f };
+      int qi = 0; uint64_t acc = 0;
+      for(int b = 0; b <= AGX_DE_BINS && qi < 3; b++)
+      {
+        acc += h[b];
+        while(qi < 3 && acc >= (uint64_t)(q[qi] * cnt)) pc[qi++] = b * 0.1f;
+      }
+      while(qi < 3) pc[qi++] = AGX_DE_BINS * 0.1f;
+      dt_print(DT_DEBUG_PIPE,
+               "[agx displacement] %s moved=%5.2f%%  dE p50=%.2f p95=%.2f p99=%.2f  area>dE2=%5.2f%%",
+               nm, 100.0 * cnt / n_pixels, pc[0], pc[1], pc[2], 100.0 * over2 / n_pixels);
+    }
+    free(de_forced); free(de_moved);
+  }
+
   agx_compute_histogram(self, piece, ivoid, roi_in);
 }
 
@@ -3024,7 +3112,7 @@ void gui_update(dt_iop_module_t *self)
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->completely_reverse_primaries),
                                p->completely_reverse_primaries);
 
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->diag_toggle), p->diag_mode > 0);
+  dt_bauhaus_combobox_set(g->diag_combo, CLAMP(p->diag_mode, 0, 2));
 
   // paper-profile combobox (pos 0 = none; real profiles at out_pos + 1)
   dt_bauhaus_combobox_set(g->gamut_profile, 0);
@@ -3286,11 +3374,11 @@ static void _agx_gamut_use_softproof(GtkWidget *widget, dt_iop_module_t *self)
   dt_bauhaus_combobox_set(g->gamut_profile, pos);
 }
 
-static void _agx_diag_toggled(GtkWidget *w, dt_iop_module_t *self)
+static void _agx_diag_changed(GtkWidget *w, dt_iop_module_t *self)
 {
   if(darktable.gui->reset) return;
   dt_iop_agx_params_t *p = self->params;
-  p->diag_mode = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)) ? 1 : 0;
+  p->diag_mode = dt_bauhaus_combobox_get(w);
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
@@ -3343,16 +3431,25 @@ static void _create_gamut_page(dt_iop_module_t *main, dt_iop_agx_gui_data_t *g)
       "lower = a wider soft roll-off; 100% = compress only what is beyond the boundary."));
 
   dt_gui_box_add(page_gamut, dt_ui_section_label_new(_("diagnostic")));
-  g->diag_toggle = gtk_check_button_new_with_label(_("show out-of-gamut"));
-  gtk_widget_set_tooltip_text(g->diag_toggle,
-    _("overlay against the real paper ICC (Yrg Ych, same model as the compressor):\n"
+  g->diag_combo = dt_bauhaus_combobox_new(main);
+  dt_bauhaus_widget_set_label(g->diag_combo, NULL, N_("diagnostic overlay"));
+  dt_bauhaus_combobox_add(g->diag_combo, _("off"));
+  dt_bauhaus_combobox_add(g->diag_combo, _("out of gamut"));
+  dt_bauhaus_combobox_add(g->diag_combo, _("displacement"));
+  gtk_widget_set_tooltip_text(g->diag_combo,
+    _("darkroom-only overlay against the real paper ICC (Yrg Ych, same model as the compressor);\n"
+      "shown on the final output, never on the histogram or the export. needs a paper profile.\n"
+      "\n"
+      "out of gamut (after compression):\n"
       "  magenta = out of gamut by chroma (desaturating brings it in)\n"
-      "  orange  = out of gamut by luminance (too light/dark for the paper --\n"
-      "            desaturating cannot fix it; needs a lightness change)\n"
-      "shown on the final output (after compression), on the darkroom view only --\n"
-      "never on the histogram or the export. needs a paper profile set above."));
-  g_signal_connect(G_OBJECT(g->diag_toggle), "toggled", G_CALLBACK(_agx_diag_toggled), main);
-  dt_gui_box_add(page_gamut, g->diag_toggle);
+      "  orange  = out of gamut by luminance (too light/dark -- needs a lightness change)\n"
+      "\n"
+      "displacement (how far compression moved each pixel, delta-E):\n"
+      "  magenta = pixels forced in (were out of gamut) -- the compressor's job\n"
+      "  cyan    = in-gamut pixels the soft knee moved anyway -- the transition cost\n"
+      "  (dimmed grey = unmoved). per-population stats print with -d pipe."));
+  g_signal_connect(G_OBJECT(g->diag_combo), "value-changed", G_CALLBACK(_agx_diag_changed), main);
+  dt_gui_box_add(page_gamut, g->diag_combo);
 }
 
 void gui_init(dt_iop_module_t *self)
