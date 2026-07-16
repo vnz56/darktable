@@ -311,9 +311,13 @@ typedef struct primaries_params_t
 #define AGX_GAMUT_LUT_NH 72
 #define AGX_GAMUT_LUT_NY 48
 #define AGX_GAMUT_LUT_YMAX 1.1f
-// Compress toward a fraction of the measured boundary (the Yrg device-cube
-// boundary over-estimates the true ICC gamut) so results land safely inside.
-#define AGX_GAMUT_SAFETY 0.95f
+// Compress toward a fraction of the measured boundary to absorb the LUT's
+// over-estimation of the true ICC gamut. Measured (dense-sampling ground truth vs
+// the N=192 + Y-interp LUT): the LUT over-estimates only ~2% of the time, p99.9 of
+// the LUT/true ratio is 1.006 -> a 0.994 margin covers 99.9% of the gamut. 0.95 was
+// hand-picked and threw away ~4.5% of boundary chroma everywhere (visible on the
+// yellows/deep reds of narrow mat papers). 0.99 recovers that and stays safe.
+#define AGX_GAMUT_SAFETY 0.99f
 typedef struct dt_iop_agx_data_t
 {
   tone_mapping_params_t tone_mapping_params;
