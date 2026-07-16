@@ -1572,6 +1572,42 @@ static void _agx_build_gamut_lut(dt_iop_agx_data_t *d,
       }
   }
   cmsDeleteTransform(tr);
+
+  // Fill unsampled (h,Y) bins. The cube-surface sampling leaves holes (wide gamuts, high Y,
+  // sparse hues); an empty bin reads cmax=0 -> the compressor skips it (if(cmax<=1e-4) return)
+  // AND the diagnostic paints it OOG -> magenta that never compresses. Bilinear lookup across a
+  // 0-valued neighbour also under-cuts cmax at the filled-region edge (residual OOG liseré).
+  // Grassfire-propagate the mean of filled neighbours into every empty bin so cmax is defined
+  // everywhere the compressor / diagnostic query it.
+  {
+    int holes0 = 0;
+    for(int hb = 0; hb < AGX_GAMUT_LUT_NH; hb++)
+      for(int yb = 0; yb < AGX_GAMUT_LUT_NY; yb++)
+        if(d->gamut_chroma_max[hb][yb] <= 0.f) holes0++;
+    int remaining = holes0;
+    for(int pass = 0; pass < AGX_GAMUT_LUT_NH + AGX_GAMUT_LUT_NY && remaining > 0; pass++)
+    {
+      remaining = 0;
+      for(int hb = 0; hb < AGX_GAMUT_LUT_NH; hb++)
+        for(int yb = 0; yb < AGX_GAMUT_LUT_NY; yb++)
+        {
+          if(d->gamut_chroma_max[hb][yb] > 0.f) continue;
+          const int hm = (hb + AGX_GAMUT_LUT_NH - 1) % AGX_GAMUT_LUT_NH;
+          const int hp = (hb + 1) % AGX_GAMUT_LUT_NH;
+          const int ym = yb > 0 ? yb - 1 : yb, yp = yb < AGX_GAMUT_LUT_NY - 1 ? yb + 1 : yb;
+          const float nb[4] = { d->gamut_chroma_max[hm][yb], d->gamut_chroma_max[hp][yb],
+                                d->gamut_chroma_max[hb][ym], d->gamut_chroma_max[hb][yp] };
+          float sum = 0.f; int cnt = 0;
+          for(int k = 0; k < 4; k++) if(nb[k] > 0.f) { sum += nb[k]; cnt++; }
+          if(cnt > 0) d->gamut_chroma_max[hb][yb] = sum / cnt;
+          else remaining++;
+        }
+    }
+    dt_print(DT_DEBUG_PIPE,
+             "[agx gamut LUT] %d/%d bins empty, %d remain after fill; Y range [%.4f, %.4f]",
+             holes0, AGX_GAMUT_LUT_NH * AGX_GAMUT_LUT_NY, remaining, d->gamut_ymin, d->gamut_ymax);
+  }
+
   d->gamut_lut_valid = TRUE;
   d->gamut_lut_profile_type = type;
   g_strlcpy(d->gamut_lut_profile, filename, sizeof(d->gamut_lut_profile));
